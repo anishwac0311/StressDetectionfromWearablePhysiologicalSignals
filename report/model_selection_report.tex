@@ -1,0 +1,288 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{float}
+\usepackage[section]{placeins}
+
+\title{WESAD: Model Selection Report}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ======================================================================
+\section{Introduction}
+% ======================================================================
+
+This report documents the model selection process for classifying physiological states---Baseline, Stress, and Amusement---using the WESAD wearable sensor dataset.
+All experiments use \textbf{Leave-One-Subject-Out (LOSO)} cross-validation across 15 subjects, ensuring that reported metrics reflect true subject-generalisation rather than within-subject memorisation.
+
+Two classification tasks are evaluated:
+\begin{itemize}
+    \item \textbf{3-class}: Amusement (195 windows) vs.\ Baseline (628) vs.\ Stress (355).
+    \item \textbf{Binary}: Not-Stress (823) vs.\ Stress (355).
+\end{itemize}
+
+Two data variants are compared:
+\begin{itemize}
+    \item \textbf{Sensor-only} (26 features): summary statistics from EDA, BVP, temperature, respiration, and accelerometer signals.
+    \item \textbf{Sensor + demographics} (29 features): the above plus age, height, and weight.
+\end{itemize}
+
+Four model families are evaluated: Logistic Regression, Random Forest, XGBoost, and a feed-forward MLP (PyTorch).
+The primary metric is \textbf{Macro-F1}, which weights each class equally and is more informative than accuracy under class imbalance.
+
+% ======================================================================
+\section{Candidate Models and Selection Rationale}
+% ======================================================================
+
+\subsection{Logistic Regression}
+Logistic Regression is included as a \textbf{linear baseline}.
+It assumes a linear decision boundary in feature space, making it fast to train and easy to interpret.
+If a linear model already performs well, it suggests the classes are reasonably separable in the engineered feature space.
+Conversely, a large gap between Logistic Regression and nonlinear models indicates that complex feature interactions are important.
+We use L2 regularisation ($C=1.0$) with the L-BFGS solver.
+
+\subsection{Random Forest}
+Random Forest is a \textbf{tree-ensemble} method that naturally handles nonlinear relationships and feature interactions without requiring feature scaling.
+It is robust to outliers and provides built-in feature importance estimates.
+We use 200 trees, maximum depth 10, and \texttt{class\_weight='balanced'} to address the label imbalance.
+Its inclusion tests whether axis-aligned decision boundaries (splits on individual features) are sufficient for this task.
+
+\subsection{XGBoost}
+XGBoost is a \textbf{gradient-boosted tree} ensemble that typically achieves state-of-the-art results on tabular data.
+Unlike Random Forest, which builds independent trees, XGBoost fits each successive tree to the residual errors of the ensemble, producing a more refined decision surface.
+We use 200 boosting rounds, depth~6, and learning rate 0.1.
+Comparing XGBoost against Random Forest reveals whether the boosting strategy yields meaningful gains on this dataset size (1{,}178 windows).
+
+\subsection{Feed-Forward MLP (StressNet)}
+The MLP is a \textbf{neural network baseline} motivated by the original WESAD notebooks.
+The architecture is a 3-layer network (input $\rightarrow$ 128 $\rightarrow$ 256 $\rightarrow$ output) with BatchNorm, ReLU activations, and 30\% dropout.
+Unlike the tree-based models, the MLP can learn smooth nonlinear decision boundaries and benefits from feature standardisation.
+It is trained with Adam (lr $= 10^{-3}$), weighted cross-entropy loss, and 80 epochs per fold.
+Its inclusion tests whether a parametric deep model outperforms non-parametric ensembles given the moderate dataset size.
+
+% ======================================================================
+\section{Results: 3-Class Classification}
+\label{sec:results-3class}
+% ======================================================================
+
+Table~\ref{tab:3class} summarises all 3-class experiments under LOSO evaluation.
+
+\begin{table}[H]
+\centering
+\caption{3-class LOSO results (Amusement / Baseline / Stress). Best values in \textbf{bold}.}
+\label{tab:3class}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Model} & \textbf{Data Variant} & \textbf{Mean Accuracy} & \textbf{Mean Macro-F1} \\
+\midrule
+Logistic Regression & sensor        & $0.719 \pm 0.172$ & $0.588 \pm 0.180$ \\
+Logistic Regression & sensor+demo   & $0.718 \pm 0.167$ & $0.607 \pm 0.181$ \\
+\midrule
+Random Forest       & sensor        & $0.731 \pm 0.205$ & $0.663 \pm 0.230$ \\
+Random Forest       & sensor+demo   & $0.737 \pm 0.194$ & $0.664 \pm 0.223$ \\
+\midrule
+XGBoost             & sensor        & $0.737 \pm 0.205$ & $\mathbf{0.677 \pm 0.235}$ \\
+XGBoost             & sensor+demo   & $\mathbf{0.742 \pm 0.192}$ & $0.663 \pm 0.223$ \\
+\midrule
+MLP (StressNet)     & sensor        & $0.714 \pm 0.149$ & $0.679 \pm 0.165$ \\
+MLP (StressNet)     & sensor+demo   & $0.680 \pm 0.162$ & $0.620 \pm 0.168$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Class Breakdown}
+
+Table~\ref{tab:3class-perclass} shows per-class precision, recall, and F1 for the best-performing configuration of each model family (sensor-only for MLP and XGBoost F1; sensor+demo for RF and XGBoost accuracy).
+
+\begin{table}[H]
+\centering
+\caption{Per-class metrics for selected 3-class experiments (aggregated across all LOSO folds).}
+\label{tab:3class-perclass}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Model} & \textbf{Class} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Logistic Regression & Amusement & 0.410 & 0.221 & 0.287 \\
+Logistic Regression & Baseline  & 0.723 & 0.817 & 0.767 \\
+Logistic Regression & Stress    & 0.799 & 0.817 & 0.808 \\
+\midrule
+Random Forest & Amusement & 0.550 & 0.508 & 0.528 \\
+Random Forest & Baseline  & 0.773 & 0.748 & 0.761 \\
+Random Forest & Stress    & 0.749 & 0.823 & 0.784 \\
+\midrule
+XGBoost & Amusement & 0.573 & 0.523 & 0.547 \\
+XGBoost & Baseline  & 0.783 & 0.748 & 0.765 \\
+XGBoost & Stress    & 0.738 & 0.831 & 0.781 \\
+\midrule
+MLP (sensor) & Amusement & 0.397 & 0.651 & 0.493 \\
+MLP (sensor) & Baseline  & 0.851 & 0.619 & 0.717 \\
+MLP (sensor) & Stress    & 0.813 & 0.918 & 0.862 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+
+\begin{itemize}
+    \item \textbf{Amusement is the hardest class.}
+    All models struggle with Amusement (F1 $\leq 0.55$ for tree models, 0.29 for Logistic Regression).
+    This is expected: Amusement has the fewest samples (195) and its physiological signature partially overlaps with Baseline.
+
+    \item \textbf{XGBoost achieves the highest Macro-F1} (0.677) on sensor features, while also reaching the highest accuracy (0.742) when demographics are included.
+    The boosting strategy provides a meaningful improvement over Random Forest for the minority Amusement class.
+
+    \item \textbf{The MLP trades balance for Stress recall.}
+    The MLP achieves the highest Stress F1 (0.862) and the highest Amusement recall (0.651), but at the cost of Baseline recall (0.619).
+    Its overall Macro-F1 (0.679) is competitive with XGBoost but has lower accuracy.
+    The MLP also has the \textbf{lowest standard deviation} across folds ($\pm 0.149$), indicating more stable generalisation.
+
+    \item \textbf{Demographics provide marginal benefit.}
+    Adding age, height, and weight improves results for tree-based models by 0.5--1\% but \emph{hurts} the MLP.
+    Demographics are constant within a subject and risk acting as subject identifiers rather than genuine predictors.
+\end{itemize}
+
+
+% ======================================================================
+\section{Results: Binary Classification (Stress vs.\ Not-Stress)}
+\label{sec:results-binary}
+% ======================================================================
+
+Table~\ref{tab:binary} summarises binary classification results.
+
+\begin{table}[H]
+\centering
+\caption{Binary LOSO results (Not-Stress / Stress). Best values in \textbf{bold}.}
+\label{tab:binary}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Model} & \textbf{Data Variant} & \textbf{Mean Accuracy} & \textbf{Mean Macro-F1} \\
+\midrule
+Logistic Regression & sensor        & $0.886 \pm 0.161$ & $0.866 \pm 0.188$ \\
+Logistic Regression & sensor+demo   & $0.873 \pm 0.162$ & $0.853 \pm 0.177$ \\
+\midrule
+Random Forest       & sensor        & $0.865 \pm 0.214$ & $0.837 \pm 0.244$ \\
+Random Forest       & sensor+demo   & $0.878 \pm 0.205$ & $0.851 \pm 0.238$ \\
+\midrule
+XGBoost             & sensor        & $0.858 \pm 0.219$ & $0.835 \pm 0.239$ \\
+XGBoost             & sensor+demo   & $0.867 \pm 0.205$ & $0.845 \pm 0.228$ \\
+\midrule
+MLP (StressNet)     & sensor        & $\mathbf{0.906 \pm 0.181}$ & $\mathbf{0.898 \pm 0.192}$ \\
+MLP (StressNet)     & sensor+demo   & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Class Breakdown}
+
+\begin{table}[H]
+\centering
+\caption{Per-class metrics for selected binary experiments.}
+\label{tab:binary-perclass}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Model} & \textbf{Class} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Logistic Regression & Not-Stress & 0.914 & 0.922 & 0.918 \\
+Logistic Regression & Stress     & 0.816 & 0.800 & 0.808 \\
+\midrule
+Random Forest & Not-Stress & 0.911 & 0.893 & 0.902 \\
+Random Forest & Stress     & 0.763 & 0.797 & 0.780 \\
+\midrule
+XGBoost & Not-Stress & 0.913 & 0.880 & 0.896 \\
+XGBoost & Stress     & 0.743 & 0.806 & 0.773 \\
+\midrule
+MLP (sensor) & Not-Stress & 0.971 & 0.891 & 0.929 \\
+MLP (sensor) & Stress     & 0.787 & 0.938 & 0.856 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+
+\begin{itemize}
+    \item \textbf{The MLP is the clear winner for binary stress detection}, achieving 0.906 accuracy and 0.898 Macro-F1.
+    It reaches 93.8\% Stress recall---far higher than any tree model---while maintaining high Not-Stress precision (0.971).
+
+    \item \textbf{Logistic Regression is a strong binary baseline.}
+    At 0.886 accuracy and 0.866 Macro-F1, the linear model outperforms both tree ensembles.
+    This suggests that Stress vs.\ Not-Stress is largely linearly separable in the engineered feature space.
+
+    \item \textbf{Tree models have higher fold-to-fold variance.}
+    Random Forest and XGBoost both exhibit standard deviations exceeding $\pm 0.20$, indicating that certain subjects are very difficult regardless of model.
+    The MLP and Logistic Regression are somewhat more stable.
+
+    \item \textbf{Binary is substantially easier than 3-class.}
+    All models gain 12--19 percentage points in Macro-F1 moving from 3-class to binary, confirming that the Amusement/Baseline distinction is the primary source of difficulty.
+\end{itemize}
+
+
+% ======================================================================
+\section{Overall Model Comparison}
+\label{sec:comparison}
+% ======================================================================
+
+\begin{table}[H]
+\centering
+\caption{Summary of best configuration per model family.}
+\label{tab:summary}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{\textbf{3-Class}} & \multicolumn{2}{c}{\textbf{Binary}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+\textbf{Model} & \textbf{Acc} & \textbf{F1} & \textbf{Acc} & \textbf{F1} \\
+\midrule
+Logistic Regression & 0.719 & 0.607 & \underline{0.886} & \underline{0.866} \\
+Random Forest       & 0.737 & 0.664 & 0.878 & 0.851 \\
+XGBoost             & \underline{0.742} & 0.677 & 0.867 & 0.845 \\
+MLP (StressNet)     & 0.714 & \underline{0.679} & \textbf{0.906} & \textbf{0.898} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Key takeaways:
+
+\begin{enumerate}
+    \item \textbf{For binary stress detection, the MLP is the recommended model.}
+    It achieves the highest accuracy (0.906) and Macro-F1 (0.898), with particularly strong Stress recall (0.938).
+
+    \item \textbf{For 3-class classification, XGBoost or MLP are preferred}, depending on the priority.
+    XGBoost has the best accuracy (0.742); the MLP has the best Macro-F1 (0.679) and the lowest variance.
+
+    \item \textbf{Logistic Regression remains a competitive baseline}, especially in binary mode where it outperforms both tree ensembles.
+
+    \item \textbf{Sensor-only features are generally sufficient.}
+    Demographics rarely improve results and can hurt neural network performance by introducing subject-level confounds.
+
+    \item \textbf{All models exhibit high variance} across LOSO folds ($\pm 0.15$--$0.24$), reflecting genuine inter-subject physiological differences that no model has fully overcome.
+\end{enumerate}
+
+
+% ======================================================================
+\section{Future Work: ResNet for Time-Series Classification}
+\label{sec:future-resnet}
+% ======================================================================
+
+A natural extension of this work is to apply \textbf{Residual Networks (ResNets)} directly to the raw wrist time-series.
+While this report evaluates models on pre-extracted window-level features, ResNets can learn hierarchical temporal representations end-to-end from the raw signals, potentially capturing patterns that hand-crafted statistics miss.
+
+\subsection{Why ResNet?}
+\begin{itemize}
+    \item \textbf{1D-ResNet for time-series} has been shown to achieve strong results on the UCR time-series classification benchmark, often matching or exceeding RNN-based approaches while being faster to train.
+    \item \textbf{Skip connections} address the vanishing gradient problem, enabling much deeper networks (20--50+ layers) compared to the 2--3-layer GRU/LSTM and MLP architectures used here.
+    \item \textbf{No recurrence}: ResNets process the full window in parallel via convolutions, avoiding the sequential bottleneck of RNNs and enabling better GPU utilisation.
+\end{itemize}
+
+\subsection{Proposed Architecture}
+A 1D-ResNet for WESAD would take a 30-second window of 6 wrist channels resampled to 4\,Hz (shape $120 \times 6$) as input, pass it through three residual blocks (each with two 1D convolution layers, BatchNorm, ReLU, and a skip connection), apply global average pooling over the time dimension, and feed the result into a fully connected classification head.
+This architecture has roughly 100K parameters---comparable to the MLP---and should train within minutes on the WESAD dataset.
+Using the same LOSO evaluation and 30-second windows would allow direct comparison with the tabular and RNN results in this report.
+
+\end{document}

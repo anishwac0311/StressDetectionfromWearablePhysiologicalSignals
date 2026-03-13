@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+
+# Raw WESAD dataset
+WESAD/data/WESAD/
+
+# Generated EDA outputs
+eda_outputs_m14/
+eda_outputs_m14_timeseries/
+eda_outputs_m14_correlation/
+eda_outputs_m14_comparative/
+eda_outputs_wesad_raw/
+
+# Report build artifacts
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc
+report/*.pdf
+
+# Python packaging / testing caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

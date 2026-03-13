@@ -1,0 +1,28 @@
+%% Minimal local shim for missing grfext.sty (TinyTeX)
+%% This project only includes PNG graphics; EPS conversion features are not needed.
+%% The epstopdf-base package expects \PrependGraphicsExtensions / \AppendGraphicsExtensions.
+%%
+%% Place this file next to wesad_report.tex so pdfLaTeX can find it.
+%%
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{grfext}[2026/02/25 v0.1 Minimal shim for project compilation]
+
+\makeatletter
+
+% \Gin@extensions is defined by graphicx/graphics. If it's not available yet, do nothing.
+\providecommand*\PrependGraphicsExtensions[1]{%
+  \@ifundefined{Gin@extensions}{}{%
+    \edef\Gin@extensions{#1,\Gin@extensions}%
+  }%
+}
+
+\providecommand*\AppendGraphicsExtensions[1]{%
+  \@ifundefined{Gin@extensions}{}{%
+    \edef\Gin@extensions{\Gin@extensions,#1}%
+  }%
+}
+
+\makeatother
+
+\endinput
+

@@ -1,0 +1,2549 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{float}                % enables [H] placement
+\usepackage[section]{placeins}    % prevents floats crossing sections
+
+\title{WESAD: Data Transformation and Exploratory Data Analysis}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+% --- helpers ---
+\newcommand{\FigIfExists}[4]{%
+  \begin{figure}[H]
+    \centering
+    \IfFileExists{#1}{\includegraphics[width=#2\linewidth]{\detokenize{#1}}}{\fbox{\parbox{0.95\linewidth}{Missing figure: \texttt{#1}\\\newline Run the corresponding EDA script to generate it.}}}
+    \caption{#3}
+    \label{#4}
+  \end{figure}
+}
+
+\newcommand{\SubFigIfExists}[5]{%
+  \begin{subfigure}{#2\linewidth}
+    \centering
+    \IfFileExists{#1}{\includegraphics[width=\linewidth]{\detokenize{#1}}}{\fbox{\parbox{0.95\linewidth}{Missing figure: \texttt{#1}}}}
+    \caption{#3}
+    \label{#4}
+  \end{subfigure}
+}
+
+\begin{document}
+\maketitle
+
+\section{WESAD overview (what it is and what it contains)}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected in a controlled lab protocol to study how
+physiological and movement signals relate to stress and affect.
+Each subject experiences protocol segments such as \textbf{baseline} (rest), \textbf{stress} (stress induction), and \textbf{amusement} (positive affect).
+
+\subsection{What data types are present?}
+WESAD is not an image or text dataset. It contains:
+\begin{itemize}
+  \item \textbf{Time-series sensor signals} from wrist and chest devices (e.g., EDA, BVP/PPG, ACC, temperature, respiration).
+  \item \textbf{A synchronized label stream} indicating which protocol segment is active over time.
+  \item \textbf{Subject metadata} (demographics and questionnaire-style yes/no responses) stored in per-subject readme files.
+\end{itemize}
+
+\subsection{Why it is useful for stress modeling}
+WESAD supports stress detection research because it enables:
+\begin{itemize}
+  \item \textbf{Multimodal learning}: combining physiological and movement signals.
+  \item \textbf{Window-based supervised learning}: converting continuous recordings into labeled examples.
+  \item \textbf{Cross-subject generalization}: evaluating whether a model trained on some subjects works on new subjects.
+\end{itemize}
+
+\section{Data transformation (implemented in \texttt{data\_wrangling.py})}
+Raw WESAD recordings are multi-rate time series (different sensors have different sampling frequencies).
+Most EDA and most classifiers are easier to run on a \textbf{fixed-length window} dataset where each row is one labeled example.
+The transformation pipeline converts raw signals into a window-level feature table.
+
+\subsection{What the transformation does (conceptually)}
+\begin{enumerate}
+  \item \textbf{Load raw wrist/chest signals and labels.}
+  \item \textbf{Denoise signals} (e.g., smoothing / low-pass filtering) to reduce high-frequency noise and improve robustness.
+  \item \textbf{Time-align modalities.} Because sensors are sampled at different rates, signals are aligned onto a consistent timeline.
+        Labels are propagated so every aligned time point (and later every window) has an associated class.
+  \item \textbf{EDA decomposition (cvxEDA).} EDA can be decomposed into:
+        \textbf{tonic} (slow baseline drift) and \textbf{phasic} (fast skin conductance responses), which can be more informative for stress.
+  \item \textbf{Split into protocol segments} using the synchronized label stream.
+  \item \textbf{Windowing.} The continuous signal is partitioned into fixed windows (30 seconds), creating labeled examples.
+  \item \textbf{Feature extraction per window.} For each sensor channel, compute summary statistics (mean/std/min/max) and a few derived features.
+\end{enumerate}
+
+\subsection{Why summary statistics are used as features}
+Window features compress high-frequency signals into stable vectors that still capture the window's overall level, variability, and extremes.
+
+\subsubsection*{Mean, median, and mode (what they are)}
+\begin{itemize}
+  \item \textbf{Mean}: arithmetic average; captures typical level but is sensitive to spikes/outliers.
+  \item \textbf{Median}: middle value; robust to spikes (often useful when artifacts are common).
+  \item \textbf{Mode}: most frequent value; usually more useful for discrete variables (e.g., labels) than for continuous physiology.
+\end{itemize}
+
+\subsubsection*{Other window statistics used here}
+\begin{itemize}
+  \item \textbf{Standard deviation (std)}: within-window variability (often rises with motion artifacts in BVP).
+  \item \textbf{Min/max}: extremes (physiological peaks or artifacts).
+  \item \textbf{Slope}: trend across a window (e.g., temperature drift).
+  \item \textbf{Peak frequency}: dominant periodic structure (useful for BVP).
+  \item \textbf{ACC magnitude}: compact movement intensity (also highlights confounding).
+\end{itemize}
+
+\subsection{Sensor modalities and derived features (plain-language)}
+\begin{itemize}
+  \item \textbf{EDA}: skin conductance; reflects sympathetic arousal, but drifts slowly and depends on skin contact.
+  \item \textbf{EDA phasic}: fast-changing EDA component (SCR-like responses); often more directly linked to arousal.
+  \item \textbf{EDA tonic}: slow EDA baseline level (SCL); captures longer-term shifts and drift.
+  \item \textbf{EDA SMNA / sparse driver}: decomposition component representing estimated ``event-like'' driver activity.
+  \item \textbf{BVP (PPG)}: optical pulse signal; carries heart-beat periodicity but is very motion-sensitive on the wrist.
+  \item \textbf{BVP peak frequency}: dominant BVP frequency in a window; proxy for periodic structure/heart-rate band behavior (can be distorted by artifacts).
+  \item \textbf{TEMP}: wrist skin temperature; slow-varying, often informative via trends rather than rapid changes.
+  \item \textbf{TEMP slope}: temperature trend within a window (warming/cooling).
+  \item \textbf{ACC}: 3-axis accelerometer; movement intensity/posture changes; important both as predictor and artifact indicator.
+  \item \textbf{net\_acc}: acceleration magnitude (roughly $\sqrt{x^2+y^2+z^2}$) summarized over a window; compact movement feature.
+  \item \textbf{Resp}: respiration signal; stress can affect breathing rate/variability and complements EDA/BVP.
+\end{itemize}
+
+\section{Metadata parsing and merging (implemented in \texttt{readme\_parser.py})}
+Subjects differ in demographic and contextual factors (age, gender, smoking, etc.). These fields are extracted and encoded (e.g., one-hot indicators)
+to support interpretation and confound analysis.
+
+\section{Final dataset: \texttt{data/m14\_merged.csv}}
+\subsection{What one row represents}
+Each row corresponds to one \textbf{30-second window} from one subject, represented by engineered window features plus a class label and metadata.
+
+\subsection{Label meanings}
+The labels used in \texttt{m14\_merged.csv} are:
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Label value} & \textbf{Meaning} \\
+\midrule
+0 & amusement \\
+1 & baseline \\
+2 & stress \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3--4 sample rows (subset of columns)}
+\begin{table}[H]
+  \centering
+  \small
+  \begin{tabular}{@{}rrrrrrrrr@{}}
+    \toprule
+    idx & subject & label & EDA\_mean & EDA\_phasic\_mean & BVP\_std & TEMP\_mean & Resp\_std & net\_acc\_mean \\
+    \midrule
+    0 & 2 & 1 & 1.398 & 1.829 & 107.679 & 35.817 & 0.011 & 0.026 \\
+    1 & 2 & 1 & 1.210 & 2.111 & 118.776 & 35.798 & 0.021 & 0.029 \\
+    2 & 2 & 1 & 1.011 & 0.153 & 42.202 & 35.713 & 0.011 & 0.033 \\
+    3 & 2 & 1 & 0.775 & 0.178 & 41.619 & 35.701 & 0.003 & 0.018 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sample windows from \texttt{m14\_merged.csv} (representative subset of columns).}
+  \label{tab:samples}
+\end{table}
+
+\subsection{Column-by-column explanation}
+\renewcommand{\arraystretch}{1.1}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+\caption{\label{tab:columns}Column headers in \texttt{m14\_merged.csv} and their meaning.}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{(blank first column)} & CSV index column from export; not a feature. \\
+
+\texttt{EDA\_mean} & Mean of wrist electrodermal activity (EDA) in the window. \\
+\texttt{EDA\_std} & Standard deviation of EDA in the window. \\
+\texttt{EDA\_min} & Minimum EDA in the window. \\
+\texttt{EDA\_max} & Maximum EDA in the window. \\
+
+\texttt{EDA\_phasic\_mean} & Mean of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_std} & Std of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_min} & Minimum of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_max} & Maximum of the phasic EDA component in the window. \\
+
+\texttt{EDA\_smna\_mean} & Mean of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_std} & Std of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_min} & Minimum of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_max} & Maximum of the sparse driver component in the window. \\
+
+\texttt{EDA\_tonic\_mean} & Mean of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_std} & Std of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_min} & Minimum of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_max} & Maximum of the tonic EDA component in the window. \\
+
+\texttt{BVP\_mean} & Mean of wrist blood volume pulse (BVP) in the window. \\
+\texttt{BVP\_std} & Std of BVP in the window. \\
+\texttt{BVP\_min} & Minimum BVP in the window. \\
+\texttt{BVP\_max} & Maximum BVP in the window. \\
+
+\texttt{TEMP\_mean} & Mean wrist skin temperature in the window. \\
+\texttt{TEMP\_std} & Std of temperature in the window. \\
+\texttt{TEMP\_min} & Minimum temperature in the window. \\
+\texttt{TEMP\_max} & Maximum temperature in the window. \\
+
+\texttt{ACC\_x\_mean} & Mean wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_std} & Std wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_min} & Minimum wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_max} & Maximum wrist acceleration (x-axis) in the window. \\
+
+\texttt{ACC\_y\_mean} & Mean wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_std} & Std wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_min} & Minimum wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_max} & Maximum wrist acceleration (y-axis) in the window. \\
+
+\texttt{ACC\_z\_mean} & Mean wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_std} & Std wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_min} & Minimum wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_max} & Maximum wrist acceleration (z-axis) in the window. \\
+
+\texttt{Resp\_mean} & Mean respiration signal in the window. \\
+\texttt{Resp\_std} & Std respiration signal in the window. \\
+\texttt{Resp\_min} & Minimum respiration signal in the window. \\
+\texttt{Resp\_max} & Maximum respiration signal in the window. \\
+
+\texttt{net\_acc\_mean} & Mean acceleration magnitude in the window. \\
+\texttt{net\_acc\_std} & Std acceleration magnitude in the window. \\
+\texttt{net\_acc\_min} & Minimum acceleration magnitude in the window. \\
+\texttt{net\_acc\_max} & Maximum acceleration magnitude in the window. \\
+
+\texttt{BVP\_peak\_freq} & Dominant frequency of BVP in the window. \\
+\texttt{TEMP\_slope} & Linear temperature trend across the window. \\
+
+\texttt{subject} & Subject identifier (integer). \\
+\texttt{label} & Window label (0=amusement, 1=baseline, 2=stress). \\
+
+\texttt{age} & Subject age. \\
+\texttt{height} & Subject height. \\
+\texttt{weight} & Subject weight. \\
+
+\texttt{gender\_ female} & One-hot indicator: female. \\
+\texttt{gender\_ male} & One-hot indicator: male. \\
+\texttt{coffee\_today\_YES} & One-hot indicator: drank coffee today. \\
+\texttt{sport\_today\_YES} & One-hot indicator: did sports today. \\
+\texttt{smoker\_NO} & One-hot indicator: not a smoker. \\
+\texttt{smoker\_YES} & One-hot indicator: smoker. \\
+\texttt{feel\_ill\_today\_YES} & One-hot indicator: feels ill today. \\
+
+\end{longtable}
+
+\section{Exploratory data analysis (EDA): what each plot tells us and why it matters}
+The EDA is designed to answer three modeling-critical questions:
+\begin{enumerate}
+  \item \textbf{Is the dataset balanced and comparable across subjects?}
+  \item \textbf{Do features separate the classes, and which modalities matter most?}
+  \item \textbf{Are there artifacts/outliers or subject-specific effects that will hurt generalization?}
+\end{enumerate}
+
+\subsection{Dataset composition and balance}
+\begin{figure}[H]
+  \centering
+  \SubFigIfExists{eda_outputs_m14/01_label_counts.png}{0.49}{Overall class balance.}{fig:label_counts}{}
+  \hfill
+  \SubFigIfExists{eda_outputs_m14/02_windows_per_subject_stacked.png}{0.49}{Per-subject window counts split by label.}{fig:w_per_subj}{}
+  \caption{Composition plots used to assess imbalance and protocol consistency.}
+  \label{fig:composition}
+\end{figure}
+
+\paragraph{What you can gather.} Class imbalance and subject imbalance guide class weighting, sampling, and which metrics to report (e.g., macro-F1).
+
+\subsection{Univariate feature separation}
+\begin{figure}[H]
+  \centering
+  \SubFigIfExists{eda_outputs_m14/03_box_eda_mean_by_label.png}{0.49}{EDA mean by label.}{fig:eda_mean_box}{}
+  \hfill
+  \SubFigIfExists{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}{0.49}{EDA phasic mean by label.}{fig:eda_phasic_box}{}
+  \caption{Univariate comparisons to see which features shift across conditions.}
+  \label{fig:univariate}
+\end{figure}
+
+\paragraph{What you can gather.} Whether stress shifts central tendency, how much overlap exists, and whether outliers/artifacts are present.
+
+\subsection{Movement confounding check}
+\FigIfExists{eda_outputs_m14/05_box_net_acc_mean_by_label.png}{0.62}{Acceleration magnitude by label (detects motion confounding).}{fig:motion_conf}
+
+\paragraph{What you can gather.} If motion differs by label, a model may learn artifacts; motivates motion-aware preprocessing and ablations.
+
+\subsection{Correlation and redundancy (original heatmap)}
+\FigIfExists{eda_outputs_m14/06_corr_heatmap_subset.png}{0.72}{Correlation heatmap (subset) for redundancy/interaction analysis.}{fig:corr_subset}
+
+\paragraph{What you can gather.} Highly correlated features are redundant; motivates feature selection/regularization.
+
+\subsection{Additional correlation analysis (from \texttt{eda\_m14\_correlation.py})}
+\FigIfExists{eda_outputs_m14_correlation/01_corr_overall_spearman.png}{0.78}{Overall correlation (Spearman).}{fig:corr_overall_s}
+\FigIfExists{eda_outputs_m14_correlation/02_corr_overall_pearson.png}{0.78}{Overall correlation (Pearson).}{fig:corr_overall_p}
+
+\paragraph{How to interpret.}
+\begin{itemize}
+  \item \textbf{Spearman} captures monotonic relationships (more robust to heavy tails/outliers).
+  \item \textbf{Pearson} captures linear relationships (sensitive to outliers).
+  \item Large blocks of high correlation indicate redundant engineered features; consider dropping some or using stronger regularization.
+\end{itemize}
+
+\subsubsection*{Condition-specific correlation shifts}
+\FigIfExists{eda_outputs_m14_correlation/04_corr_label_1_baseline_spearman.png}{0.78}{Spearman correlation within baseline windows.}{fig:corr_base}
+\FigIfExists{eda_outputs_m14_correlation/04_corr_label_2_stress_spearman.png}{0.78}{Spearman correlation within stress windows.}{fig:corr_stress}
+\FigIfExists{eda_outputs_m14_correlation/04_corr_label_0_amusement_spearman.png}{0.78}{Spearman correlation within amusement windows.}{fig:corr_amuse}
+
+\paragraph{Why this is useful.} If correlations change by condition (e.g., motion correlates with BVP variability only in stress), it suggests
+condition-specific coupling or artifacts, and motivates modality ablations and robustness checks.
+
+\subsection{Low-dimensional projections (PCA)}
+\begin{figure}[H]
+  \centering
+  \SubFigIfExists{eda_outputs_m14/07_pca_scatter_by_label.png}{0.49}{PCA colored by label.}{fig:pca_label}{}
+  \hfill
+  \SubFigIfExists{eda_outputs_m14/08_pca_scatter_by_subject.png}{0.49}{PCA colored by subject.}{fig:pca_subject}{}
+  \caption{PCA projections to compare label structure vs subject structure.}
+  \label{fig:pca}
+\end{figure}
+
+\paragraph{What you can gather.} If windows cluster by subject more than label, cross-subject generalization is harder and LOSO is required.
+
+\subsection{Window timelines and outlier windows (within-subject)}
+\FigIfExists{eda_outputs_m14_timeseries/subject_02_label_timeline.png}{0.92}{Within-subject label segments across window index.}{fig:timeline}
+\FigIfExists{eda_outputs_m14_timeseries/subject_02_feature_traces.png}{0.80}{Within-subject feature traces across windows with outliers highlighted.}{fig:traces}
+
+\paragraph{What you can gather.} Drift vs sudden jumps, whether outliers concentrate in certain segments, and whether transitions align with changes.
+
+\subsection{Raw signal inspection with label overlay}
+\FigIfExists{eda_outputs_wesad_raw/S02_raw_EDA.png}{0.92}{Raw EDA with protocol labels overlaid.}{fig:raw_eda}
+\FigIfExists{eda_outputs_wesad_raw/S02_raw_BVP.png}{0.92}{Raw BVP with protocol labels overlaid (spikes often indicate motion artifacts).}{fig:raw_bvp}
+\FigIfExists{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}{0.92}{Raw acceleration magnitude with labels overlaid (validates motion artifacts).}{fig:raw_acc}
+\FigIfExists{eda_outputs_wesad_raw/S02_raw_TEMP.png}{0.92}{Raw temperature with labels overlaid (slow trends and drift).}{fig:raw_temp}
+\FigIfExists{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}{0.92}{Combined raw EDA + BVP view with labels overlaid.}{fig:raw_combined}
+
+\paragraph{What you can gather.} Whether BVP spikes align with ACC bursts, segment-level data quality differences, and plausible raw trends.
+
+\subsection{Comparative feature analysis (from \texttt{eda\_m14\_comparative.py})}
+\FigIfExists{eda_outputs_m14_comparative/01_bivariate_01_EDA_phasic_mean_vs_BVP_std.png}{0.75}{Example bivariate relationship: EDA\_phasic\_mean vs BVP\_std (colored by label).}{fig:bivar1}
+\FigIfExists{eda_outputs_m14_comparative/04_feature_ranking_mutual_info_top20.png}{0.85}{Top features ranked by mutual information with the label.}{fig:mi_rank}
+\FigIfExists{eda_outputs_m14_comparative/05_feature_ranking_effectsize_eps2_top20.png}{0.85}{Top features ranked by robust multiclass effect size (epsilon$^2$).}{fig:eps2_rank}
+
+\paragraph{How to interpret.}
+\begin{itemize}
+  \item Bivariate plots show class separation that may be weak in any single feature but stronger in combinations.
+  \item Mutual information highlights nonlinear predictive features; effect size highlights features with strong distribution shifts across classes.
+  \item Rankings help choose smaller feature sets and guide sensor ablations (which modalities matter most).
+\end{itemize}
+
+\section{Generalization and why LOSO is used}
+\subsection{What ``generalization'' means here}
+Generalization means: a model trained on some subjects should correctly classify windows from a \textbf{new subject} never seen during training.
+
+\subsection{Why random train/test splits are misleading}
+If windows are randomly split, windows from the same subject appear in both train and test.
+Because subjects have strong physiological ``signatures'', the model can partially memorize subject-specific patterns, inflating test accuracy.
+
+\subsection{Leave-One-Subject-Out (LOSO)}
+LOSO cross-validation holds out one subject for testing and trains on the remaining subjects, repeating this for each subject.
+This directly measures subject-independent performance and is the most appropriate estimate of wearable generalization.
+
+\section{How the EDA informs model selection and training}
+\begin{itemize}
+  \item Use \textbf{LOSO} to estimate cross-subject generalization.
+  \item Standardize features and consider per-subject normalization to reduce baseline shifts.
+  \item Run modality \textbf{ablations} (motion-only vs physiology-only vs fused) to avoid learning motion artifacts.
+  \item Address outliers/artifacts via robust scaling, clipping, or window-quality filtering.
+\end{itemize}
+
+\end{document}
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{float}     % enables [H] placement
+\usepackage[section]{placeins} % prevents floats crossing sections
+
+\title{WESAD: Data Transformation and Exploratory Data Analysis}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{WESAD overview (what it is and what it contains)}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected in a controlled lab protocol to study how
+physiological and movement signals relate to stress and affect.
+Each subject experiences multiple \textbf{protocol segments} such as \textbf{baseline} (rest), \textbf{stress} (stress induction),
+and \textbf{amusement} (positive affect).
+
+\subsection{What data types are present?}
+WESAD is not an image or text dataset. It contains:
+\begin{itemize}
+  \item \textbf{Time-series sensor signals} from wrist and chest devices (e.g., EDA, BVP/PPG, ACC, temperature, respiration).
+  \item \textbf{A synchronized label stream} indicating which protocol segment is active at each moment in time.
+  \item \textbf{Subject metadata} (demographics and questionnaire-style yes/no responses) stored in per-subject readme files.
+\end{itemize}
+
+\subsection{Why it is useful for stress modeling}
+WESAD supports stress detection research because it enables:
+\begin{itemize}
+  \item \textbf{Multimodal learning}: combining physiological and movement signals.
+  \item \textbf{Window-based supervised learning}: converting continuous recordings into labeled examples.
+  \item \textbf{Cross-subject generalization}: evaluating whether a model trained on some subjects works on new subjects.
+\end{itemize}
+
+\section{Data transformation (implemented in \texttt{data\_wrangling.py})}
+Raw WESAD recordings are multi-rate time series (different sensors have different sampling frequencies).
+Most EDA and most classifiers are easier to run on a \textbf{fixed-length window} dataset where each row is one labeled example.
+The transformation pipeline converts raw signals into a window-level feature table.
+
+\subsection{What the transformation does (conceptually)}
+\begin{enumerate}
+  \item \textbf{Load raw wrist/chest signals and labels.}
+  \item \textbf{Denoise signals} (e.g., smoothing / low-pass filtering) to reduce high-frequency noise and improve robustness.
+  \item \textbf{Time-align modalities.} Because sensors are sampled at different rates, signals are aligned onto a consistent timeline.
+        Labels are propagated so that every aligned time point (and later every window) has an associated class.
+  \item \textbf{EDA decomposition (cvxEDA).} EDA can be decomposed into:
+        \textbf{tonic} (slow baseline drift) and \textbf{phasic} (fast skin conductance responses), which can be more informative for stress.
+  \item \textbf{Split into protocol segments} (baseline / stress / amusement) using the synchronized label stream.
+  \item \textbf{Windowing.} The continuous signal is partitioned into fixed windows (30 seconds), creating a sequence of labeled examples.
+  \item \textbf{Feature extraction per window.} For each sensor channel, compute summary statistics (mean/std/min/max).
+        Add a few domain-engineered features (e.g., ACC magnitude, BVP dominant frequency, temperature slope).
+\end{enumerate}
+
+\subsection{Why summary statistics are used as features}
+The window feature columns (e.g., \texttt{EDA\_mean}, \texttt{BVP\_std}, \texttt{TEMP\_max}) are \textbf{summary statistics}
+computed over all samples inside one window. The goal is to compress a high-frequency signal into a stable vector that still captures
+the window's overall level, variability, and extremes.
+
+\subsubsection*{Mean, median, and mode (what they are)}
+\begin{itemize}
+  \item \textbf{Mean} is the arithmetic average. It captures the typical level of a signal in the window, but can be sensitive to spikes/outliers.
+  \item \textbf{Median} is the middle value after sorting. It is more robust to spikes and is often used when artifacts are common.
+        (This project uses mean/std/min/max, but median is a common alternative summary feature.)
+  \item \textbf{Mode} is the most frequent value. For continuous physiological signals it is usually less informative unless values are quantized/binned,
+        but for discrete variables (e.g., a label sequence) mode corresponds to the most common class.
+\end{itemize}
+
+\subsubsection*{Other window statistics used here}
+\begin{itemize}
+  \item \textbf{Standard deviation (std)} measures variability within the window (often rises with motion artifacts in BVP).
+  \item \textbf{Min/max} capture extremes, which can reflect physiological peaks or sensor artifacts.
+  \item \textbf{Slope} captures monotonic trends (e.g., temperature drifting).
+  \item \textbf{Peak frequency} captures dominant periodic structure (useful for signals like BVP).
+  \item \textbf{ACC magnitude} provides a compact movement summary and helps detect confounding between label and motion.
+\end{itemize}
+
+\subsection{Sensor modalities and derived features (plain-language)}
+Below are short explanations of the main signals and derived features used in this project.
+
+\begin{itemize}
+  \item \textbf{EDA (Electrodermal Activity)}: skin conductance (typically in $\mu$S). It reflects sympathetic nervous system activity
+        (sweat gland activity) and often increases with stress/arousal, but can drift slowly over time and is sensitive to skin contact.
+  \item \textbf{EDA phasic}: the fast-changing component of EDA associated with short skin conductance responses (SCRs). This is commonly
+        used as an arousal-related feature because it emphasizes rapid responses rather than slow baseline drift.
+  \item \textbf{EDA tonic}: the slow baseline level of EDA (sometimes called SCL). It captures longer-term shifts and drift across the protocol.
+  \item \textbf{EDA SMNA / sparse driver}: an auxiliary component from the EDA decomposition that represents estimated ``event-like'' driver activity.
+        It can be useful for capturing when rapid EDA responses are being generated.
+
+  \item \textbf{BVP (Blood Volume Pulse / PPG)}: an optical photoplethysmography signal from the wrist. It contains pulsatile information related to
+        heart beats (heart rate / variability proxies) but is highly sensitive to motion artifacts and poor sensor contact.
+  \item \textbf{BVP peak frequency}: the dominant frequency in the BVP window (from a periodogram). It summarizes periodic structure in the signal
+        and can correlate with heart-rate band behavior; large motion artifacts can also distort it.
+
+  \item \textbf{TEMP (Skin temperature)}: wrist skin temperature. It usually changes slowly and can reflect peripheral vasoconstriction/vasodilation
+        and environmental effects; it is often more informative through trends than rapid fluctuations.
+  \item \textbf{TEMP slope}: the linear trend of temperature within a window, capturing gradual warming/cooling.
+
+  \item \textbf{ACC (Accelerometer)}: 3-axis wrist acceleration. It measures movement/gesture intensity and posture changes.
+        ACC features are important both as predictive features and as a way to detect confounding (movement can create artifacts in BVP/EDA).
+  \item \textbf{net\_acc (ACC magnitude)}: a single ``overall movement'' value computed from the 3 axes (roughly $\sqrt{x^2+y^2+z^2}$),
+        then summarized over the window. This is a compact motion intensity feature.
+
+  \item \textbf{Resp (Respiration)}: breathing-related signal from the chest device. Stress can change breathing rate and variability; respiration is
+        often complementary to EDA/BVP for stress detection.
+\end{itemize}
+
+\section{Metadata parsing and merging (implemented in \texttt{readme\_parser.py})}
+Protocol labels indicate the active condition, but subjects differ in demographic and contextual factors (age, gender, smoking, etc.).
+Metadata parsing extracts these fields and encodes them as model-ready columns (e.g., one-hot indicators).
+
+\subsection{Why include metadata?}
+Metadata can be used to:
+\begin{itemize}
+  \item support \textbf{interpretation} (e.g., some physiological baselines differ by subject characteristics),
+  \item support \textbf{confound analysis} (checking whether subgroups differ systematically),
+  \item optionally provide \textbf{covariates} (with care to avoid leakage in evaluation).
+\end{itemize}
+
+\section{Final dataset: \texttt{data/m14\_merged.csv}}
+\subsection{What one row represents}
+Each row corresponds to one \textbf{30-second window} from one subject, represented by engineered window features plus a class label and metadata.
+
+\subsection{Label meanings}
+The labels used in \texttt{m14\_merged.csv} are:
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Label value} & \textbf{Meaning} \\
+\midrule
+0 & amusement \\
+1 & baseline \\
+2 & stress \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3--4 sample rows (subset of columns)}
+The dataset is wide; Table~\ref{tab:samples} shows a small subset of representative columns for 4 windows.
+
+\begin{table}[H]
+  \centering
+  \small
+  \begin{tabular}{@{}rrrrrrrrr@{}}
+    \toprule
+    idx & subject & label & EDA\_mean & EDA\_phasic\_mean & BVP\_std & TEMP\_mean & Resp\_std & net\_acc\_mean \\
+    \midrule
+    0 & 2 & 1 & 1.398 & 1.829 & 107.679 & 35.817 & 0.011 & 0.026 \\
+    1 & 2 & 1 & 1.210 & 2.111 & 118.776 & 35.798 & 0.021 & 0.029 \\
+    2 & 2 & 1 & 1.011 & 0.153 & 42.202 & 35.713 & 0.011 & 0.033 \\
+    3 & 2 & 1 & 0.775 & 0.178 & 41.619 & 35.701 & 0.003 & 0.018 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sample windows from \texttt{m14\_merged.csv} (representative subset of columns).}
+  \label{tab:samples}
+\end{table}
+
+\subsection{Column-by-column explanation}
+Table~\ref{tab:columns} lists every column header and explains what it measures.
+
+\renewcommand{\arraystretch}{1.1}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+\caption{\label{tab:columns}Column headers in \texttt{m14\_merged.csv} and their meaning.}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{(blank first column)} & CSV index column from export; not a feature. \\
+
+\texttt{EDA\_mean} & Mean of wrist electrodermal activity (EDA) in the window. \\
+\texttt{EDA\_std} & Standard deviation of EDA in the window. \\
+\texttt{EDA\_min} & Minimum EDA in the window. \\
+\texttt{EDA\_max} & Maximum EDA in the window. \\
+
+\texttt{EDA\_phasic\_mean} & Mean of the phasic EDA component (fast responses) in the window. \\
+\texttt{EDA\_phasic\_std} & Std of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_min} & Minimum of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_max} & Maximum of the phasic EDA component in the window. \\
+
+\texttt{EDA\_smna\_mean} & Mean of the sparse driver component from EDA decomposition in the window. \\
+\texttt{EDA\_smna\_std} & Std of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_min} & Minimum of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_max} & Maximum of the sparse driver component in the window. \\
+
+\texttt{EDA\_tonic\_mean} & Mean of the tonic EDA component (slow drift / baseline level) in the window. \\
+\texttt{EDA\_tonic\_std} & Std of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_min} & Minimum of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_max} & Maximum of the tonic EDA component in the window. \\
+
+\texttt{BVP\_mean} & Mean of wrist blood volume pulse (BVP) in the window. \\
+\texttt{BVP\_std} & Std of BVP in the window (often increases with motion artifacts). \\
+\texttt{BVP\_min} & Minimum BVP in the window. \\
+\texttt{BVP\_max} & Maximum BVP in the window. \\
+
+\texttt{TEMP\_mean} & Mean wrist skin temperature in the window. \\
+\texttt{TEMP\_std} & Std of temperature in the window. \\
+\texttt{TEMP\_min} & Minimum temperature in the window. \\
+\texttt{TEMP\_max} & Maximum temperature in the window. \\
+
+\texttt{ACC\_x\_mean} & Mean wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_std} & Std wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_min} & Minimum wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_max} & Maximum wrist acceleration (x-axis) in the window. \\
+
+\texttt{ACC\_y\_mean} & Mean wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_std} & Std wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_min} & Minimum wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_max} & Maximum wrist acceleration (y-axis) in the window. \\
+
+\texttt{ACC\_z\_mean} & Mean wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_std} & Std wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_min} & Minimum wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_max} & Maximum wrist acceleration (z-axis) in the window. \\
+
+\texttt{Resp\_mean} & Mean respiration signal in the window. \\
+\texttt{Resp\_std} & Std respiration signal in the window. \\
+\texttt{Resp\_min} & Minimum respiration signal in the window. \\
+\texttt{Resp\_max} & Maximum respiration signal in the window. \\
+
+\texttt{net\_acc\_mean} & Mean acceleration magnitude (derived from ACC x/y/z) in the window. \\
+\texttt{net\_acc\_std} & Std acceleration magnitude in the window. \\
+\texttt{net\_acc\_min} & Minimum acceleration magnitude in the window. \\
+\texttt{net\_acc\_max} & Maximum acceleration magnitude in the window. \\
+
+\texttt{BVP\_peak\_freq} & Dominant frequency of BVP in the window (periodogram peak). \\
+\texttt{TEMP\_slope} & Linear temperature trend across the window. \\
+
+\texttt{subject} & Subject identifier (integer). \\
+\texttt{label} & Window label (0=amusement, 1=baseline, 2=stress). \\
+
+\texttt{age} & Subject age. \\
+\texttt{height} & Subject height. \\
+\texttt{weight} & Subject weight. \\
+
+\texttt{gender\_ female} & One-hot indicator: female. \\
+\texttt{gender\_ male} & One-hot indicator: male. \\
+\texttt{coffee\_today\_YES} & One-hot indicator: drank coffee today. \\
+\texttt{sport\_today\_YES} & One-hot indicator: did sports today. \\
+\texttt{smoker\_NO} & One-hot indicator: not a smoker. \\
+\texttt{smoker\_YES} & One-hot indicator: smoker. \\
+\texttt{feel\_ill\_today\_YES} & One-hot indicator: feels ill today. \\
+
+\end{longtable}
+
+\section{Exploratory data analysis (EDA): what each plot tells us and why it matters}
+The EDA is designed to answer three modeling-critical questions:
+\begin{enumerate}
+  \item \textbf{Is the dataset balanced and comparable across subjects?}
+  \item \textbf{Do features separate the classes, and which modalities matter most?}
+  \item \textbf{Are there artifacts/outliers or subject-specific effects that will hurt generalization?}
+\end{enumerate}
+
+\subsection{Dataset composition and balance}
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/01_label_counts.png}}
+    \caption{Overall class balance.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/02_windows_per_subject_stacked.png}}
+    \caption{Per-subject window counts split by label.}
+  \end{subfigure}
+  \caption{Composition plots used to assess imbalance and protocol consistency.}
+  \label{fig:composition}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether the dataset is \textbf{class imbalanced} (one label has far more windows).
+  \item Whether each subject contributes a similar number of windows (protocol consistency) or some subjects dominate the dataset.
+  \item Whether any class is missing or underrepresented for some subjects (can cause unstable training/evaluation).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+These plots guide class-weighting, balanced sampling, and whether to report metrics robust to imbalance (e.g., macro-F1).
+
+\subsection{Univariate feature separation by label}
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/03_box_eda_mean_by_label.png}}
+    \caption{EDA mean by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}}
+    \caption{EDA phasic mean by label.}
+  \end{subfigure}
+  \caption{Univariate comparisons to see which physiological features shift across conditions.}
+  \label{fig:univariate}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether stress tends to have \textbf{higher central tendency} than baseline/amusement.
+  \item How much \textbf{overlap} exists between classes (heavy overlap suggests single features are not sufficient).
+  \item Presence of \textbf{outliers} that may correspond to artifacts or rare physiological events.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+If a single modality shows strong separation, simpler models may perform well; if separation is weak, multimodal fusion helps.
+
+\subsection{Movement confounding check}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.62\linewidth]{\detokenize{eda_outputs_m14/05_box_net_acc_mean_by_label.png}}
+  \caption{Acceleration magnitude by label (used to detect motion confounding).}
+  \label{fig:motion_conf}
+\end{figure}
+
+\paragraph{What you can gather from this plot.}
+\begin{itemize}
+  \item Whether one label coincides with systematically higher movement.
+  \item Whether there is a potential \textbf{confound}: ``stress'' $\approx$ ``movement'' rather than ``stress'' $\approx$ ``physiology''.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+If movement differs by label, a classifier may learn motion artifacts (especially in wrist BVP).
+
+\subsection{Correlation and redundancy}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\linewidth]{\detokenize{eda_outputs_m14/06_corr_heatmap_subset.png}}
+  \caption{Correlation heatmap (subset) for redundancy/interaction analysis.}
+  \label{fig:corr}
+\end{figure}
+
+\paragraph{What you can gather from this plot.}
+\begin{itemize}
+  \item Which features are highly redundant (very high correlation).
+  \item Which modalities move together (e.g., motion correlating with BVP variability).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Redundancy motivates feature selection, dimensionality reduction, and/or stronger regularization.
+
+\subsection{Low-dimensional projections (PCA)}
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/07_pca_scatter_by_label.png}}
+    \caption{PCA colored by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/08_pca_scatter_by_subject.png}}
+    \caption{PCA colored by subject.}
+  \end{subfigure}
+  \caption{PCA projections to compare label structure vs subject structure.}
+  \label{fig:pca}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether windows cluster primarily by \textbf{label} or by \textbf{subject}.
+  \item Whether there are extreme outliers that might distort training.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Subject clustering is a sign of cross-subject distribution shift and motivates LOSO evaluation and normalization strategies.
+
+\subsection{Window timelines and outlier windows (within-subject)}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_label_timeline.png}}
+  \caption{Within-subject label segments across window index.}
+  \label{fig:timeline}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_feature_traces.png}}
+  \caption{Within-subject feature traces across windows with outliers highlighted.}
+  \label{fig:traces}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether features drift gradually or jump suddenly (possible artifacts).
+  \item Whether outliers concentrate in particular protocol segments.
+  \item Whether label transitions align with abrupt physiological changes (sanity check).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Outlier windows can dominate training and degrade generalization; these plots motivate robust scaling and window filtering.
+
+\subsection{Raw signal inspection with label overlay}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA.png}}
+  \caption{Raw EDA with protocol labels overlaid.}
+  \label{fig:raw_eda}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
+  \caption{Raw BVP with protocol labels overlaid (spikes often indicate motion artifacts).}
+  \label{fig:raw_bvp}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
+  \caption{Raw acceleration magnitude with labels overlaid (used to validate motion artifacts).}
+  \label{fig:raw_acc}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
+  \caption{Raw temperature with labels overlaid (slow trends and drift).}
+  \label{fig:raw_temp}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}}
+  \caption{Combined raw EDA + BVP view with labels overlaid.}
+  \label{fig:raw_combined}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether BVP spikes co-occur with ACC bursts (motion artifacts).
+  \item Whether one segment is systematically noisier than others (data quality differs by condition).
+  \item Whether raw trends (EDA, TEMP) plausibly change across the protocol segments.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Raw inspection prevents misinterpretation of window features and supports artifact-aware preprocessing and window-quality rules.
+
+\section{Generalization and why LOSO is used}
+\subsection{What ``generalization'' means here}
+In this project, \textbf{generalization} means: a model trained on some subjects should correctly classify windows from a \textbf{new subject}
+it has never seen during training.
+
+\subsection{Why random train/test splits are misleading}
+If windows are randomly split across train and test, windows from the \emph{same subject} appear in both sets.
+Because each subject has a strong physiological ``signature'', the model can partially memorize subject-specific patterns.
+This yields overly optimistic test performance that does not reflect real-world performance on new users.
+
+\subsection{Leave-One-Subject-Out (LOSO)}
+LOSO cross-validation evaluates generalization by holding out one subject as the test set and training on all remaining subjects.
+This is repeated for each subject; the final performance is the average (and often the variability) across held-out subjects.
+
+\paragraph{Why LOSO is appropriate for WESAD.}
+\begin{itemize}
+  \item It directly measures subject-independent performance (the realistic wearable deployment setting).
+  \item It tests the model under distribution shift (different baselines across people).
+  \item It discourages leakage and inflated accuracy caused by within-subject correlations.
+\end{itemize}
+
+\section{How the EDA informs model selection and training}
+The transformation and EDA support the following decisions:
+\begin{itemize}
+  \item \textbf{Validation strategy}: use LOSO to estimate cross-subject generalization.
+  \item \textbf{Scaling and normalization}: standardize features (and consider per-subject normalization) to reduce baseline shifts.
+  \item \textbf{Confound-aware modeling}: compare motion-only vs physiology-only vs fused models to ensure the model learns stress physiology.
+  \item \textbf{Robustness}: address outliers/artifacts via robust scaling, clipping, and/or removal of low-quality windows.
+  \item \textbf{Feature/model choice}: if univariate plots show limited separation, prioritize multimodal fusion and stronger regularization.
+\end{itemize}
+
+\end{document}
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\title{WESAD: Data Transformation and Exploratory Data Analysis}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{WESAD overview (what it is and what it contains)}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected in a controlled lab protocol to study how
+physiological and movement signals relate to stress and affect.
+Each subject experiences multiple \textbf{protocol segments} such as \textbf{baseline} (rest), \textbf{stress} (stress induction),
+and \textbf{amusement} (positive affect).
+
+\subsection{What data types are present?}
+WESAD is not an image or text dataset. It contains:
+\begin{itemize}
+  \item \textbf{Time-series sensor signals} from wrist and chest devices (e.g., EDA, BVP/PPG, ACC, temperature, respiration).
+  \item \textbf{A synchronized label stream} indicating which protocol segment is active at each moment in time.
+  \item \textbf{Subject metadata} (demographics and questionnaire-style yes/no responses) stored in per-subject readme files.
+\end{itemize}
+
+\subsection{Why it is useful for stress modeling}
+WESAD supports stress detection research because it enables:
+\begin{itemize}
+  \item \textbf{Multimodal learning}: combining physiological and movement signals.
+  \item \textbf{Window-based supervised learning}: converting continuous recordings into labeled examples.
+  \item \textbf{Cross-subject generalization}: evaluating whether a model trained on some subjects works on new subjects.
+\end{itemize}
+
+\section{Data transformation (implemented in \texttt{data\_wrangling.py})}
+Raw WESAD recordings are multi-rate time series (different sensors have different sampling frequencies).
+Most EDA and most classifiers are easier to run on a \textbf{fixed-length window} dataset where each row is one labeled example.
+The transformation pipeline converts raw signals into a window-level feature table.
+
+\subsection{What the transformation does (conceptually)}
+\begin{enumerate}
+  \item \textbf{Load raw wrist/chest signals and labels.}
+  \item \textbf{Denoise signals} (e.g., smoothing / low-pass filtering) to reduce high-frequency noise and improve robustness.
+  \item \textbf{Time-align modalities.} Because sensors are sampled at different rates, signals are aligned onto a consistent timeline.
+        Labels are propagated so that every aligned time point (and later every window) has an associated class.
+  \item \textbf{EDA decomposition (cvxEDA).} EDA can be decomposed into:
+        \textbf{tonic} (slow baseline drift) and \textbf{phasic} (fast skin conductance responses), which can be more informative for stress.
+  \item \textbf{Split into protocol segments} (baseline / stress / amusement) using the synchronized label stream.
+  \item \textbf{Windowing.} The continuous signal is partitioned into fixed windows (30 seconds), creating a sequence of labeled examples.
+  \item \textbf{Feature extraction per window.} For each sensor channel, compute summary statistics (mean/std/min/max).
+        Add a few domain-engineered features (e.g., ACC magnitude, BVP dominant frequency, temperature slope).
+\end{enumerate}
+
+\subsection{Why summary statistics are used as features}
+The window feature columns (e.g., \texttt{EDA\_mean}, \texttt{BVP\_std}, \texttt{TEMP\_max}) are \textbf{summary statistics}
+computed over all samples inside one window. The goal is to compress a high-frequency signal into a stable vector that still captures
+the window's overall level, variability, and extremes.
+
+\subsubsection*{Mean, median, and mode (what they are)}
+\begin{itemize}
+  \item \textbf{Mean} is the arithmetic average. It captures the typical level of a signal in the window, but can be sensitive to spikes/outliers.
+  \item \textbf{Median} is the middle value after sorting. It is more robust to spikes and is often used when artifacts are common.
+        (This project uses mean/std/min/max, but median is a common alternative summary feature.)
+  \item \textbf{Mode} is the most frequent value. For continuous physiological signals it is usually less informative unless values are quantized/binned,
+        but for discrete variables (e.g., a label sequence) mode corresponds to the most common class.
+\end{itemize}
+
+\subsubsection*{Other window statistics used here}
+\begin{itemize}
+  \item \textbf{Standard deviation (std)} measures variability within the window (often rises with motion artifacts in BVP).
+  \item \textbf{Min/max} capture extremes, which can reflect physiological peaks or sensor artifacts.
+  \item \textbf{Slope} captures monotonic trends (e.g., temperature drifting).
+  \item \textbf{Peak frequency} captures dominant periodic structure (useful for signals like BVP).
+  \item \textbf{ACC magnitude} provides a compact movement summary and helps detect confounding between label and motion.
+\end{itemize}
+
+\section{Metadata parsing and merging (implemented in \texttt{readme\_parser.py})}
+Protocol labels indicate the active condition, but subjects differ in demographic and contextual factors (age, gender, smoking, etc.).
+Metadata parsing extracts these fields and encodes them as model-ready columns (e.g., one-hot indicators).
+
+\subsection{Why include metadata?}
+Metadata can be used to:
+\begin{itemize}
+  \item support \textbf{interpretation} (e.g., some physiological baselines differ by subject characteristics),
+  \item support \textbf{confound analysis} (checking whether subgroups differ systematically),
+  \item optionally provide \textbf{covariates} (with care to avoid leakage in evaluation).
+\end{itemize}
+
+\section{Final dataset: \texttt{data/m14\_merged.csv}}
+\subsection{What one row represents}
+Each row corresponds to one \textbf{30-second window} from one subject, represented by engineered window features plus a class label and metadata.
+
+\subsection{Label meanings}
+The labels used in \texttt{m14\_merged.csv} are:
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Label value} & \textbf{Meaning} \\
+\midrule
+0 & amusement \\
+1 & baseline \\
+2 & stress \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3--4 sample rows (subset of columns)}
+The dataset is wide; Table~\ref{tab:samples} shows a small subset of representative columns for 4 windows.
+
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}rrrrrrrrr@{}}
+    \toprule
+    idx & subject & label & EDA\_mean & EDA\_phasic\_mean & BVP\_std & TEMP\_mean & Resp\_std & net\_acc\_mean \\
+    \midrule
+    0 & 2 & 1 & 1.398 & 1.829 & 107.679 & 35.817 & 0.011 & 0.026 \\
+    1 & 2 & 1 & 1.210 & 2.111 & 118.776 & 35.798 & 0.021 & 0.029 \\
+    2 & 2 & 1 & 1.011 & 0.153 & 42.202 & 35.713 & 0.011 & 0.033 \\
+    3 & 2 & 1 & 0.775 & 0.178 & 41.619 & 35.701 & 0.003 & 0.018 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sample windows from \texttt{m14\_merged.csv} (representative subset of columns).}
+  \label{tab:samples}
+\end{table}
+
+\subsection{Column-by-column explanation}
+Table~\ref{tab:columns} lists every column header and explains what it measures.
+
+\renewcommand{\arraystretch}{1.1}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+\caption{\label{tab:columns}Column headers in \texttt{m14\_merged.csv} and their meaning.}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{(blank first column)} & CSV index column from export; not a feature. \\
+
+\texttt{EDA\_mean} & Mean of wrist electrodermal activity (EDA) in the window. \\
+\texttt{EDA\_std} & Standard deviation of EDA in the window. \\
+\texttt{EDA\_min} & Minimum EDA in the window. \\
+\texttt{EDA\_max} & Maximum EDA in the window. \\
+
+\texttt{EDA\_phasic\_mean} & Mean of the phasic EDA component (fast responses) in the window. \\
+\texttt{EDA\_phasic\_std} & Std of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_min} & Minimum of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_max} & Maximum of the phasic EDA component in the window. \\
+
+\texttt{EDA\_smna\_mean} & Mean of the sparse driver component from EDA decomposition in the window. \\
+\texttt{EDA\_smna\_std} & Std of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_min} & Minimum of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_max} & Maximum of the sparse driver component in the window. \\
+
+\texttt{EDA\_tonic\_mean} & Mean of the tonic EDA component (slow drift / baseline level) in the window. \\
+\texttt{EDA\_tonic\_std} & Std of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_min} & Minimum of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_max} & Maximum of the tonic EDA component in the window. \\
+
+\texttt{BVP\_mean} & Mean of wrist blood volume pulse (BVP) in the window. \\
+\texttt{BVP\_std} & Std of BVP in the window (often increases with motion artifacts). \\
+\texttt{BVP\_min} & Minimum BVP in the window. \\
+\texttt{BVP\_max} & Maximum BVP in the window. \\
+
+\texttt{TEMP\_mean} & Mean wrist skin temperature in the window. \\
+\texttt{TEMP\_std} & Std of temperature in the window. \\
+\texttt{TEMP\_min} & Minimum temperature in the window. \\
+\texttt{TEMP\_max} & Maximum temperature in the window. \\
+
+\texttt{ACC\_x\_mean} & Mean wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_std} & Std wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_min} & Minimum wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_max} & Maximum wrist acceleration (x-axis) in the window. \\
+
+\texttt{ACC\_y\_mean} & Mean wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_std} & Std wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_min} & Minimum wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_max} & Maximum wrist acceleration (y-axis) in the window. \\
+
+\texttt{ACC\_z\_mean} & Mean wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_std} & Std wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_min} & Minimum wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_max} & Maximum wrist acceleration (z-axis) in the window. \\
+
+\texttt{Resp\_mean} & Mean respiration signal in the window. \\
+\texttt{Resp\_std} & Std respiration signal in the window. \\
+\texttt{Resp\_min} & Minimum respiration signal in the window. \\
+\texttt{Resp\_max} & Maximum respiration signal in the window. \\
+
+\texttt{net\_acc\_mean} & Mean acceleration magnitude (derived from ACC x/y/z) in the window. \\
+\texttt{net\_acc\_std} & Std acceleration magnitude in the window. \\
+\texttt{net\_acc\_min} & Minimum acceleration magnitude in the window. \\
+\texttt{net\_acc\_max} & Maximum acceleration magnitude in the window. \\
+
+\texttt{BVP\_peak\_freq} & Dominant frequency of BVP in the window (periodogram peak). \\
+\texttt{TEMP\_slope} & Linear temperature trend across the window. \\
+
+\texttt{subject} & Subject identifier (integer). \\
+\texttt{label} & Window label (0=amusement, 1=baseline, 2=stress). \\
+
+\texttt{age} & Subject age. \\
+\texttt{height} & Subject height. \\
+\texttt{weight} & Subject weight. \\
+
+\texttt{gender\_ female} & One-hot indicator: female. \\
+\texttt{gender\_ male} & One-hot indicator: male. \\
+\texttt{coffee\_today\_YES} & One-hot indicator: drank coffee today. \\
+\texttt{sport\_today\_YES} & One-hot indicator: did sports today. \\
+\texttt{smoker\_NO} & One-hot indicator: not a smoker. \\
+\texttt{smoker\_YES} & One-hot indicator: smoker. \\
+\texttt{feel\_ill\_today\_YES} & One-hot indicator: feels ill today. \\
+
+\end{longtable}
+
+\section{Exploratory data analysis (EDA): what each plot tells us and why it matters}
+The EDA is designed to answer three modeling-critical questions:
+\begin{enumerate}
+  \item \textbf{Is the dataset balanced and comparable across subjects?}
+  \item \textbf{Do features separate the classes, and which modalities matter most?}
+  \item \textbf{Are there artifacts/outliers or subject-specific effects that will hurt generalization?}
+\end{enumerate}
+
+\subsection{Dataset composition and balance}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/01_label_counts.png}}
+    \caption{Overall class balance.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/02_windows_per_subject_stacked.png}}
+    \caption{Per-subject window counts split by label.}
+  \end{subfigure}
+  \caption{Composition plots used to assess imbalance and protocol consistency.}
+  \label{fig:composition}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether the dataset is \textbf{class imbalanced} (one label has far more windows).
+  \item Whether each subject contributes a similar number of windows (protocol consistency) or some subjects dominate the dataset.
+  \item Whether any class is missing or underrepresented for some subjects (can cause unstable training/evaluation).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+These plots guide class-weighting, balanced sampling, and whether to report metrics robust to imbalance (e.g., macro-F1).
+
+\subsection{Univariate feature separation by label}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/03_box_eda_mean_by_label.png}}
+    \caption{EDA mean by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}}
+    \caption{EDA phasic mean by label.}
+  \end{subfigure}
+  \caption{Univariate comparisons to see which physiological features shift across conditions.}
+  \label{fig:univariate}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether stress tends to have \textbf{higher central tendency} (e.g., EDA\_mean) than baseline/amusement.
+  \item How much \textbf{overlap} exists between classes (if boxes/whiskers overlap heavily, single features are not sufficient).
+  \item Presence of \textbf{outliers} that may correspond to artifacts or rare physiological events.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+If a single modality shows strong separation, simpler models may perform well.
+If separation is weak, multimodal fusion and stronger regularization become more important.
+
+\subsection{Movement confounding check}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.62\linewidth]{\detokenize{eda_outputs_m14/05_box_net_acc_mean_by_label.png}}
+  \caption{Acceleration magnitude by label (used to detect motion confounding).}
+  \label{fig:motion_conf}
+\end{figure}
+
+\paragraph{What you can gather from this plot.}
+\begin{itemize}
+  \item Whether one label coincides with systematically higher movement.
+  \item Whether the dataset risks a \textbf{confound}: ``stress'' $\approx$ ``movement'' rather than ``stress'' $\approx$ ``physiology''.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+If movement differs by label, a classifier may learn motion artifacts (especially in wrist BVP).
+This motivates ablations (motion-only vs physiology-only vs fused) and window-quality filtering.
+
+\subsection{Correlation and redundancy}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.72\linewidth]{\detokenize{eda_outputs_m14/06_corr_heatmap_subset.png}}
+  \caption{Correlation heatmap (subset) for redundancy/interaction analysis.}
+  \label{fig:corr}
+\end{figure}
+
+\paragraph{What you can gather from this plot.}
+\begin{itemize}
+  \item Which features are highly redundant (very high correlation).
+  \item Which modalities move together (e.g., motion correlating with BVP variability).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Redundancy can inflate model complexity and overfitting; it motivates feature selection, dimensionality reduction, and regularization.
+
+\subsection{Low-dimensional projections (PCA)}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/07_pca_scatter_by_label.png}}
+    \caption{PCA colored by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/08_pca_scatter_by_subject.png}}
+    \caption{PCA colored by subject.}
+  \end{subfigure}
+  \caption{PCA projections to compare label structure vs subject structure.}
+  \label{fig:pca}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item If the points cluster primarily by \textbf{label}, the features carry condition information.
+  \item If the points cluster primarily by \textbf{subject}, subject-specific baselines dominate (distribution shift).
+  \item Extreme points can indicate outlier windows that may distort training.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Strong subject clustering motivates subject-independent evaluation (LOSO) and normalization strategies.
+
+\subsection{Window timelines and outlier windows (within-subject)}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_label_timeline.png}}
+  \caption{Within-subject label segments across window index.}
+  \label{fig:timeline}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.78\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_feature_traces.png}}
+  \caption{Within-subject feature traces across windows with outliers highlighted.}
+  \label{fig:traces}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether features drift gradually (baseline changes) or jump suddenly (possible artifacts).
+  \item Whether outliers concentrate in particular protocol segments.
+  \item Whether label transitions align with abrupt physiological changes (sanity check).
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Outlier windows can dominate gradients and degrade generalization; these plots motivate robust scaling and window filtering.
+
+\subsection{Raw signal inspection with label overlay}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA.png}}
+  \caption{Raw EDA with protocol labels overlaid.}
+  \label{fig:raw_eda}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
+  \caption{Raw BVP with protocol labels overlaid (spikes often indicate motion artifacts).}
+  \label{fig:raw_bvp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
+  \caption{Raw acceleration magnitude with labels overlaid (used to validate motion artifacts).}
+  \label{fig:raw_acc}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
+  \caption{Raw temperature with labels overlaid (slow trends and drift).}
+  \label{fig:raw_temp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}}
+  \caption{Combined raw EDA + BVP view with labels overlaid.}
+  \label{fig:raw_combined}
+\end{figure}
+
+\paragraph{What you can gather from these plots.}
+\begin{itemize}
+  \item Whether BVP ``spikes'' co-occur with ACC bursts (motion artifacts).
+  \item Whether one segment is systematically noisier than others (data quality differs by condition).
+  \item Whether raw trends (EDA, TEMP) plausibly change across the protocol segments.
+\end{itemize}
+
+\paragraph{Why it matters for training.}
+Raw inspection prevents misinterpretation of window features and supports artifact-aware preprocessing and window-quality rules.
+
+\section{Generalization and why LOSO is used}
+\subsection{What ``generalization'' means here}
+In this project, \textbf{generalization} means: a model trained on some subjects should correctly classify windows from a \textbf{new subject}
+it has never seen during training.
+
+\subsection{Why random train/test splits are misleading}
+If windows are randomly split across train and test, windows from the \emph{same subject} appear in both sets.
+Because a subject's physiology and sensor placement create a strong ``signature'', the model can partially memorize subject-specific patterns.
+This yields overly optimistic test performance that does not reflect real-world performance on new users.
+
+\subsection{Leave-One-Subject-Out (LOSO)}
+LOSO cross-validation evaluates generalization by holding out one subject as the test set and training on all remaining subjects.
+This is repeated for each subject, producing one score per held-out subject; the final reported performance is the average (and often the variance)
+across subjects.
+
+\paragraph{Why LOSO is appropriate for WESAD.}
+\begin{itemize}
+  \item It directly measures subject-independent performance (the most realistic wearable deployment setting).
+  \item It stresses the model under distribution shift (different baselines across people).
+  \item It discourages leakage and inflated accuracy caused by within-subject correlations.
+\end{itemize}
+
+\section{How the EDA informs model selection and training}
+The transformation and EDA support the following decisions:
+\begin{itemize}
+  \item \textbf{Validation strategy}: use LOSO to estimate cross-subject generalization.
+  \item \textbf{Scaling and normalization}: standardize features (and consider per-subject normalization) to reduce baseline shifts.
+  \item \textbf{Confound-aware modeling}: compare motion-only vs physiology-only vs fused models to ensure the model learns stress physiology.
+  \item \textbf{Robustness}: address outliers/artifacts via robust scaling, clipping, and/or removal of low-quality windows.
+  \item \textbf{Feature/model choice}: if univariate plots show limited separation, prioritize multimodal fusion and stronger regularization.
+\end{itemize}
+
+\end{document}
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\title{WESAD: Data Transformation and Exploratory Data Analysis}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{WESAD overview (what it is and what it contains)}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected in a controlled laboratory protocol
+to study how physiological and motion signals relate to stress and affect.
+Each subject completes multiple \textbf{protocol segments} such as \textbf{baseline} (rest), \textbf{stress} (stress induction),
+and \textbf{amusement} (positive affect).
+
+\subsection{What data types are present?}
+WESAD is not an image or text dataset. It primarily contains:
+\begin{itemize}
+  \item \textbf{Time-series sensor signals} from wrist and chest devices (e.g., EDA, BVP/PPG, ACC, temperature, respiration).
+  \item \textbf{A synchronized label stream} indicating which protocol segment is active at each moment in time.
+  \item \textbf{Subject metadata} (demographics and questionnaire-style yes/no responses) stored in per-subject readme files.
+\end{itemize}
+
+\subsection{Why it is useful for stress modeling}
+WESAD supports stress detection research because it enables:
+\begin{itemize}
+  \item \textbf{Multimodal learning}: combining physiological and movement signals.
+  \item \textbf{Window-based supervised learning}: converting continuous recordings into labeled examples.
+  \item \textbf{Cross-subject generalization}: evaluating whether a model trained on some subjects generalizes to new subjects.
+\end{itemize}
+
+\section{Data transformation pipeline (implemented in \texttt{data\_wrangling.py})}
+Raw WESAD recordings are high-frequency, multi-rate time series. Most models (and most EDA) are easier when the data is transformed into a
+\textbf{table of fixed-length windows} where each row is one labeled example. The transformation pipeline accomplishes that.
+
+\subsection{What the transformation does (conceptually)}
+\begin{enumerate}
+  \item \textbf{Load raw wrist/chest signals and labels.}
+  \item \textbf{Basic denoising} (e.g., smoothing or low-pass filtering) to reduce sensor noise that does not carry useful information.
+  \item \textbf{Time alignment across modalities.}
+  Signals are sampled at different rates (for example, EDA is much slower than BVP or ACC), so the pipeline aligns them onto a common timeline.
+  The label stream is then propagated so every time point (and later every window) receives a label.
+  \item \textbf{EDA decomposition (cvxEDA).}
+  Electrodermal activity contains both slow drift and rapid responses. Decomposing EDA into \textbf{tonic} and \textbf{phasic} components helps
+  separate background level from fast arousal-related changes.
+  \item \textbf{Segmenting and windowing.}
+  The aligned recording is split into contiguous windows of fixed duration (30 seconds). Each window becomes one training example.
+  \item \textbf{Feature extraction per window.}
+  For each sensor channel in a window, the pipeline computes summary statistics such as mean, standard deviation, minimum, and maximum.
+  Additional engineered features capture domain signals such as:
+  \begin{itemize}
+    \item \textbf{Motion magnitude} from ACC (useful both as a predictor and as a confound indicator).
+    \item \textbf{Dominant frequency} in BVP (a proxy for periodic structure; related to heart-rate band behavior).
+    \item \textbf{Temperature slope} (slow trends over the window).
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Why these steps are used (the modeling motivation)}
+\begin{itemize}
+  \item \textbf{Fixed windows} turn continuous recordings into a standard supervised learning format.
+  \item \textbf{Summary statistics} provide strong baselines and make models less sensitive to raw-signal sampling differences.
+  \item \textbf{EDA tonic/phasic features} are often more discriminative than raw EDA alone because stress can affect rapid skin conductance responses.
+  \item \textbf{Motion features} are essential because wrist BVP and EDA can be corrupted by motion; without motion-aware analysis a model may learn artifacts.
+\end{itemize}
+
+\section{Metadata parsing and merging (implemented in \texttt{readme\_parser.py})}
+The protocol labels describe \emph{what segment is happening}, but subjects also differ in demographic and contextual factors.
+The metadata parsing step extracts fields such as age/height/weight, gender, and yes/no questionnaire answers (coffee, sport, smoking, illness),
+then encodes them into machine-readable columns (e.g., one-hot indicators).
+
+\subsection{Why include metadata?}
+Metadata can support:
+\begin{itemize}
+  \item \textbf{EDA interpretation}: identifying whether some differences are demographic rather than stress-related.
+  \item \textbf{Confound analysis}: checking whether particular subject groups systematically differ in physiology.
+  \item \textbf{Optional covariate modeling}: adding subject-level context features (with care to avoid evaluation leakage).
+\end{itemize}
+
+\section{Final dataset: \texttt{data/m14\_merged.csv}}
+\subsection{What one row represents}
+Each row corresponds to one \textbf{30-second window} from one subject, represented by engineered features plus a class label and metadata.
+
+\subsection{Label meanings}
+The labels used in \texttt{m14\_merged.csv} are:
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Label value} & \textbf{Meaning} \\
+\midrule
+0 & amusement \\
+1 & baseline \\
+2 & stress \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{3--4 sample rows (subset of columns)}
+The full dataset has many columns. Table~\ref{tab:samples} shows 4 windows using a representative subset of features.
+
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}rrrrrrrrr@{}}
+    \toprule
+    idx & subject & label & EDA\_mean & EDA\_phasic\_mean & BVP\_std & TEMP\_mean & Resp\_std & net\_acc\_mean \\
+    \midrule
+    0 & 2 & 1 & 1.398 & 1.829 & 107.679 & 35.817 & 0.011 & 0.026 \\
+    1 & 2 & 1 & 1.210 & 2.111 & 118.776 & 35.798 & 0.021 & 0.029 \\
+    2 & 2 & 1 & 1.011 & 0.153 & 42.202 & 35.713 & 0.011 & 0.033 \\
+    3 & 2 & 1 & 0.775 & 0.178 & 41.619 & 35.701 & 0.003 & 0.018 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sample windows from \texttt{m14\_merged.csv} (representative subset of columns).}
+  \label{tab:samples}
+\end{table}
+
+\subsection{Column-by-column explanation}
+Table~\ref{tab:columns} lists every column header and explains what it measures.
+
+\renewcommand{\arraystretch}{1.1}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+\caption{\label{tab:columns}Column headers in \texttt{m14\_merged.csv} and their meaning.}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{(blank first column)} & CSV index column from export; not a feature. \\
+
+\texttt{EDA\_mean} & Mean of wrist electrodermal activity (EDA) in the window. \\
+\texttt{EDA\_std} & Standard deviation of EDA in the window. \\
+\texttt{EDA\_min} & Minimum EDA in the window. \\
+\texttt{EDA\_max} & Maximum EDA in the window. \\
+
+\texttt{EDA\_phasic\_mean} & Mean of the phasic EDA component (fast responses) in the window. \\
+\texttt{EDA\_phasic\_std} & Std of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_min} & Minimum of the phasic EDA component in the window. \\
+\texttt{EDA\_phasic\_max} & Maximum of the phasic EDA component in the window. \\
+
+\texttt{EDA\_smna\_mean} & Mean of the sparse driver component from EDA decomposition in the window. \\
+\texttt{EDA\_smna\_std} & Std of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_min} & Minimum of the sparse driver component in the window. \\
+\texttt{EDA\_smna\_max} & Maximum of the sparse driver component in the window. \\
+
+\texttt{EDA\_tonic\_mean} & Mean of the tonic EDA component (slow drift / baseline level) in the window. \\
+\texttt{EDA\_tonic\_std} & Std of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_min} & Minimum of the tonic EDA component in the window. \\
+\texttt{EDA\_tonic\_max} & Maximum of the tonic EDA component in the window. \\
+
+\texttt{BVP\_mean} & Mean of wrist blood volume pulse (BVP) in the window. \\
+\texttt{BVP\_std} & Std of BVP in the window (often increases with motion artifacts). \\
+\texttt{BVP\_min} & Minimum BVP in the window. \\
+\texttt{BVP\_max} & Maximum BVP in the window. \\
+
+\texttt{TEMP\_mean} & Mean wrist skin temperature in the window. \\
+\texttt{TEMP\_std} & Std of temperature in the window. \\
+\texttt{TEMP\_min} & Minimum temperature in the window. \\
+\texttt{TEMP\_max} & Maximum temperature in the window. \\
+
+\texttt{ACC\_x\_mean} & Mean wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_std} & Std wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_min} & Minimum wrist acceleration (x-axis) in the window. \\
+\texttt{ACC\_x\_max} & Maximum wrist acceleration (x-axis) in the window. \\
+
+\texttt{ACC\_y\_mean} & Mean wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_std} & Std wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_min} & Minimum wrist acceleration (y-axis) in the window. \\
+\texttt{ACC\_y\_max} & Maximum wrist acceleration (y-axis) in the window. \\
+
+\texttt{ACC\_z\_mean} & Mean wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_std} & Std wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_min} & Minimum wrist acceleration (z-axis) in the window. \\
+\texttt{ACC\_z\_max} & Maximum wrist acceleration (z-axis) in the window. \\
+
+\texttt{Resp\_mean} & Mean respiration signal in the window. \\
+\texttt{Resp\_std} & Std respiration signal in the window. \\
+\texttt{Resp\_min} & Minimum respiration signal in the window. \\
+\texttt{Resp\_max} & Maximum respiration signal in the window. \\
+
+\texttt{net\_acc\_mean} & Mean acceleration magnitude (derived from ACC x/y/z) in the window. \\
+\texttt{net\_acc\_std} & Std acceleration magnitude in the window. \\
+\texttt{net\_acc\_min} & Minimum acceleration magnitude in the window. \\
+\texttt{net\_acc\_max} & Maximum acceleration magnitude in the window. \\
+
+\texttt{BVP\_peak\_freq} & Dominant frequency of BVP in the window (periodogram peak). \\
+\texttt{TEMP\_slope} & Linear temperature trend across the window. \\
+
+\texttt{subject} & Subject identifier (integer). \\
+\texttt{label} & Window label (0=amusement, 1=baseline, 2=stress). \\
+
+\texttt{age} & Subject age. \\
+\texttt{height} & Subject height. \\
+\texttt{weight} & Subject weight. \\
+
+\texttt{gender\_ female} & One-hot indicator: female. \\
+\texttt{gender\_ male} & One-hot indicator: male. \\
+\texttt{coffee\_today\_YES} & One-hot indicator: drank coffee today. \\
+\texttt{sport\_today\_YES} & One-hot indicator: did sports today. \\
+\texttt{smoker\_NO} & One-hot indicator: not a smoker. \\
+\texttt{smoker\_YES} & One-hot indicator: smoker. \\
+\texttt{feel\_ill\_today\_YES} & One-hot indicator: feels ill today. \\
+
+\end{longtable}
+
+\section{Exploratory data analysis (EDA) and why each plot is used}
+The EDA is designed to answer three modeling-critical questions:
+\begin{enumerate}
+  \item \textbf{Is the dataset balanced and comparable across subjects?}
+  \item \textbf{Do features separate the classes, and which modalities matter most?}
+  \item \textbf{Are there artifacts/outliers or subject-specific effects that will hurt generalization?}
+\end{enumerate}
+
+\subsection{Dataset composition and class balance}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/01_label_counts.png}}
+    \caption{Overall class balance.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/02_windows_per_subject_stacked.png}}
+    \caption{Per-subject window counts split by label.}
+  \end{subfigure}
+  \caption{Composition plots used to assess imbalance and protocol consistency.}
+  \label{fig:composition}
+\end{figure}
+
+\paragraph{What and why.}
+These plots quantify how many training examples exist per class and per subject.
+They guide choices such as class-weighted loss, balanced sampling, and whether LOSO evaluation is necessary to prevent subject leakage.
+
+\subsection{Feature separability by label (univariate comparisons)}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/03_box_eda_mean_by_label.png}}
+    \caption{EDA mean by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}}
+    \caption{EDA phasic mean by label.}
+  \end{subfigure}
+  \caption{Univariate comparisons to see which physiological features shift across conditions.}
+  \label{fig:univariate}
+\end{figure}
+
+\paragraph{What and why.}
+Boxplots highlight whether a feature tends to be higher/lower under stress and how much overlap exists between classes.
+This helps prioritize modalities for modeling (e.g., EDA-heavy vs multimodal fusion) and motivates feature scaling/robustification.
+
+\subsection{Movement confounding check}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.62\linewidth]{\detokenize{eda_outputs_m14/05_box_net_acc_mean_by_label.png}}
+  \caption{Acceleration magnitude by label (used to detect motion confounding).}
+  \label{fig:motion_conf}
+\end{figure}
+
+\paragraph{What and why.}
+Wearable physiology can be corrupted by motion. If motion magnitude differs by label, a classifier may learn motion artifacts rather than stress physiology.
+This motivates motion-aware preprocessing, removing low-quality windows, and ablation studies (physiology-only vs motion-only vs fused).
+
+\subsection{Correlation and redundancy}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.72\linewidth]{\detokenize{eda_outputs_m14/06_corr_heatmap_subset.png}}
+  \caption{Correlation heatmap (subset) for redundancy/interaction analysis.}
+  \label{fig:corr}
+\end{figure}
+
+\paragraph{What and why.}
+Correlation reveals redundant features and interactions across modalities. This informs regularization strength, feature selection,
+and whether dimensionality reduction (or learned representations) may help.
+
+\subsection{Low-dimensional projections (PCA)}
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/07_pca_scatter_by_label.png}}
+    \caption{PCA colored by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/08_pca_scatter_by_subject.png}}
+    \caption{PCA colored by subject.}
+  \end{subfigure}
+  \caption{PCA projections to compare label structure vs subject structure.}
+  \label{fig:pca}
+\end{figure}
+
+\paragraph{What and why.}
+PCA provides a quick visual check of whether windows cluster more strongly by label or by subject.
+Strong subject clustering is a common signal of cross-subject distribution shift and motivates LOSO evaluation and normalization strategies.
+
+\subsection{Window timelines and outlier windows (within-subject)}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_label_timeline.png}}
+  \caption{Within-subject label segments across window index.}
+  \label{fig:timeline}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.78\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_feature_traces.png}}
+  \caption{Within-subject feature traces across windows with outliers highlighted.}
+  \label{fig:traces}
+\end{figure}
+
+\paragraph{What and why.}
+Treating windowed features as a sequence helps detect sudden jumps, drift, and rare outlier windows.
+Outlier analysis informs robust scaling, clipping strategies, and data-cleaning rules prior to training.
+
+\subsection{Raw signal inspection with label overlay}
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA.png}}
+  \caption{Raw EDA with protocol labels overlaid.}
+  \label{fig:raw_eda}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
+  \caption{Raw BVP with protocol labels overlaid (spikes often indicate motion artifacts).}
+  \label{fig:raw_bvp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
+  \caption{Raw acceleration magnitude with labels overlaid (used to validate motion artifacts).}
+  \label{fig:raw_acc}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
+  \caption{Raw temperature with labels overlaid (slow trends and drift).}
+  \label{fig:raw_temp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}}
+  \caption{Combined raw EDA + BVP view with labels overlaid.}
+  \label{fig:raw_combined}
+\end{figure}
+
+\paragraph{What and why.}
+Window-level features can hide short-lived artifacts. Raw plots are used to visually confirm:
+(i) whether BVP spikes align with movement bursts, (ii) whether some segments are consistently noisier than others, and
+(iii) whether label timing matches the observed signal changes. This informs preprocessing and window-quality filtering.
+
+\section{How the EDA informs model selection and training}
+The transformation and EDA support the following decisions:
+\begin{itemize}
+  \item \textbf{Validation strategy}: prefer cross-subject evaluation (e.g., LOSO) to measure generalization.
+  \item \textbf{Scaling and normalization}: use standardization (and consider per-subject normalization) due to subject-specific baselines.
+  \item \textbf{Confound-aware modeling}: explicitly test motion-only vs physiology-only vs fused models to ensure the model learns stress physiology.
+  \item \textbf{Robustness}: address outliers/artifacts through robust scaling, clipping, or removal of low-quality windows.
+  \item \textbf{Feature/model choice}: if univariate plots show limited separation, use multimodal fusion and/or more expressive models.
+\end{itemize}
+
+\end{document}
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\title{WESAD: Data Transformation and Exploratory Data Analysis Report}
+\author{Anishwar Chakraborty}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{What is WESAD and what does it contain?}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected to study stress and affect.
+Subjects follow a lab protocol that includes (at minimum) three key conditions:
+\textbf{baseline} (rest), \textbf{stress} (stress induction), and \textbf{amusement} (positive affect).
+
+\subsection{Modalities}
+Each subject is stored as a Python pickle file (\texttt{.pkl}) containing:
+\begin{itemize}
+  \item \textbf{Wrist (Empatica E4)}: acceleration (ACC), blood volume pulse (BVP), electrodermal activity (EDA), and skin temperature (TEMP).
+  \item \textbf{Chest (RespiBAN)}: signals such as respiration (Resp) and additional chest channels (e.g., ECG/EMG/EDA/Temp) depending on the recording.
+  \item \textbf{A high-frequency label stream}: per-sample protocol labels indicating which condition the subject is in over time.
+  \item \textbf{Subject-level metadata}: demographics and questionnaire-like fields contained in per-subject readme text files (e.g., age, gender, smoking).
+\end{itemize}
+
+\subsection{Why WESAD is suitable for modeling}
+WESAD enables subject-independent stress detection because:
+\begin{itemize}
+  \item it provides \textbf{physiological} (EDA/BVP/TEMP/Resp) and \textbf{movement} (ACC) channels,
+  \item it supports \textbf{window-based} feature extraction for classical ML or deep learning,
+  \item it supports \textbf{leave-one-subject-out (LOSO)} evaluation for generalization across subjects.
+\end{itemize}
+
+\section{Data transformation: \texttt{data\_wrangling.py}}
+The goal of \texttt{data\_wrangling.py} is to transform raw subject \texttt{.pkl} recordings into a single tabular dataset of
+\textbf{fixed-length windows} with \textbf{engineered features} and \textbf{labels} suitable for EDA and model training.
+
+\subsection{Inputs and sampling rates}
+The script uses (see \texttt{fs\_dict} and \texttt{WINDOW\_IN\_SECONDS}):
+\begin{itemize}
+  \item Wrist ACC at 32 Hz, wrist BVP at 64 Hz, wrist EDA at 4 Hz, wrist TEMP at 4 Hz.
+  \item A label stream at 700 Hz (and chest Resp is also treated as 700 Hz in this pipeline).
+  \item Window length = 30 seconds.
+\end{itemize}
+
+\subsection{Step-by-step transformation}
+For each subject \texttt{S\{id\}}:
+\begin{enumerate}
+  \item \textbf{Load raw data} via \texttt{SubjectData}, reading \texttt{data/WESAD/S\{id\}/S\{id\}.pkl}.
+        The pipeline uses wrist sensors and additionally injects chest \texttt{Resp} into the wrist dictionary.
+  \item \textbf{Preprocess and align signals} in \texttt{compute\_features}:
+  \begin{itemize}
+    \item EDA is low-pass filtered (to reduce high-frequency noise).
+    \item ACC is filtered (FIR smoothing) to reduce jitter.
+    \item Each sensor is assigned a time index based on its sampling rate, then all sensors are outer-joined into one frame.
+    \item The high-frequency label stream is joined and then forward/backward filled to cover all timestamps.
+    \item cvxEDA decomposition is applied to the filtered EDA to produce:
+          \texttt{EDA\_phasic}, \texttt{EDA\_tonic}, and \texttt{EDA\_smna}.
+  \end{itemize}
+  \item \textbf{Split into protocol conditions} using the raw WESAD label convention inside \texttt{compute\_features}:
+        baseline = 1, stress = 2, amusement = 3.
+  \item \textbf{Window the aligned data} into 30s windows in \texttt{get\_samples}:
+  \begin{itemize}
+    \item Window length is computed in label-samples: $700 \times 30$.
+    \item For each window, compute \texttt{net\_acc} (ACC magnitude) and then compute per-signal statistics:
+          \texttt{mean}, \texttt{std}, \texttt{min}, \texttt{max}.
+    \item Add two additional engineered features:
+          \texttt{BVP\_peak\_freq} (dominant frequency) and \texttt{TEMP\_slope} (linear trend).
+  \end{itemize}
+  \item \textbf{Remap labels for modeling} in \texttt{make\_patient\_data}:
+        windows are labeled as \texttt{baseline=1}, \texttt{stress=2}, \texttt{amusement=0}.
+        (This is a project-specific remap; the raw label value for amusement is 3.)
+  \item \textbf{Save per-subject feature CSVs} to \texttt{data/subject\_feats/S\{id\}\_feats\_4.csv}.
+  \item \textbf{Combine subjects} in \texttt{combine\_files} into \texttt{data/may14\_feats4.csv}.
+\end{enumerate}
+
+\subsection{Why these transformations are useful for modeling}
+\begin{itemize}
+  \item \textbf{Windowing} converts variable-length signals into a supervised learning dataset (each row is a labeled example).
+  \item \textbf{Summary features} make it easy to train baselines (MLP/trees/logistic regression) and perform fast EDA.
+  \item \textbf{EDA phasic/tonic decomposition} helps separate fast arousal-related responses from slow drift.
+  \item \textbf{Motion magnitude (net\_acc)} is critical to detect confounding from movement artifacts.
+\end{itemize}
+
+\section{Metadata parsing and final dataset: \texttt{readme\_parser.py}}
+The goal of \texttt{readme\_parser.py} is to extract subject-level metadata from each \texttt{S\{id\}\_readme.txt},
+one-hot encode categorical fields, and merge them into the window-feature dataset.
+
+\subsection{What it extracts}
+The parser searches for keys like \texttt{Age}, \texttt{Height}, \texttt{Weight}, \texttt{Gender}, and yes/no questionnaire fields
+(coffee today, sport today, smoker, feel ill today). It then:
+\begin{itemize}
+  \item saves a combined metadata table (\texttt{data/WESAD/readmes.csv}),
+  \item one-hot encodes categories using \texttt{pd.get\_dummies},
+  \item constructs a numeric \texttt{subject} id from the folder name (e.g., ``S2'' $\rightarrow 2$),
+  \item merges metadata with \texttt{data/may14\_feats4.csv} on \texttt{subject},
+  \item outputs \texttt{data/m14\_merged.csv}.
+\end{itemize}
+
+\subsection{Why this matters}
+Subject metadata can be used to:
+\begin{itemize}
+  \item perform stratified EDA (e.g., compare feature distributions by smoker status),
+  \item analyze covariates and potential confounds,
+  \item optionally augment models with subject-level covariates (with care to avoid leakage in evaluation).
+\end{itemize}
+
+\section{Final dataset: \texttt{data/m14\_merged.csv}}
+\subsection{What one row represents}
+Each row in \texttt{m14\_merged.csv} is one \textbf{30-second window} for a specific \textbf{subject}, with:
+\begin{itemize}
+  \item window-level sensor features (summary statistics and engineered features),
+  \item a window label (target),
+  \item subject-level metadata (repeated for all windows of that subject).
+\end{itemize}
+
+\subsection{Label meanings in \texttt{m14\_merged.csv}}
+The project label mapping used in this CSV is:
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Label value} & \textbf{Meaning} \\
+\midrule
+0 & amusement \\
+1 & baseline \\
+2 & stress \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Sample rows (first 4 windows)}
+For readability (the full CSV is very wide), Table~\ref{tab:samples} shows 4 sample windows with a small, representative subset of columns.
+
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}rrrrrrrrr@{}}
+    \toprule
+    idx & subject & label & EDA\_mean & EDA\_phasic\_mean & BVP\_std & TEMP\_mean & Resp\_std & net\_acc\_mean \\
+    \midrule
+    0 & 2 & 1 & 1.398 & 1.829 & 107.679 & 35.817 & 0.011 & 0.026 \\
+    1 & 2 & 1 & 1.210 & 2.111 & 118.776 & 35.798 & 0.021 & 0.029 \\
+    2 & 2 & 1 & 1.011 & 0.153 & 42.202 & 35.713 & 0.011 & 0.033 \\
+    3 & 2 & 1 & 0.775 & 0.178 & 41.619 & 35.701 & 0.003 & 0.018 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sample windows from \texttt{data/m14\_merged.csv} (subset of columns).}
+  \label{tab:samples}
+\end{table}
+
+\subsection{Column-by-column description}
+The columns can be grouped by (1) window-level sensor features, (2) engineered features, (3) identifiers/target, and (4) subject metadata.
+Table~\ref{tab:columns} lists \emph{every} header and its meaning.
+
+\renewcommand{\arraystretch}{1.1}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+\caption{\label{tab:columns}Column headers in \texttt{m14\_merged.csv} and their meaning.}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{(blank first column)} & CSV index saved by pandas when exporting; not a signal feature. \\
+
+\texttt{EDA\_mean} & Mean of wrist EDA over the 30s window. \\
+\texttt{EDA\_std} & Standard deviation of wrist EDA over the window. \\
+\texttt{EDA\_min} & Minimum of wrist EDA over the window. \\
+\texttt{EDA\_max} & Maximum of wrist EDA over the window. \\
+
+\texttt{EDA\_phasic\_mean} & Mean of cvxEDA phasic component (fast SCR-related activity) over the window. \\
+\texttt{EDA\_phasic\_std} & Std of cvxEDA phasic component over the window. \\
+\texttt{EDA\_phasic\_min} & Min of cvxEDA phasic component over the window. \\
+\texttt{EDA\_phasic\_max} & Max of cvxEDA phasic component over the window. \\
+
+\texttt{EDA\_smna\_mean} & Mean of cvxEDA sparse driver (SMNA) component over the window. \\
+\texttt{EDA\_smna\_std} & Std of cvxEDA SMNA component over the window. \\
+\texttt{EDA\_smna\_min} & Min of cvxEDA SMNA component over the window. \\
+\texttt{EDA\_smna\_max} & Max of cvxEDA SMNA component over the window. \\
+
+\texttt{EDA\_tonic\_mean} & Mean of cvxEDA tonic component (slow baseline level) over the window. \\
+\texttt{EDA\_tonic\_std} & Std of cvxEDA tonic component over the window. \\
+\texttt{EDA\_tonic\_min} & Min of cvxEDA tonic component over the window. \\
+\texttt{EDA\_tonic\_max} & Max of cvxEDA tonic component over the window. \\
+
+\texttt{BVP\_mean} & Mean of wrist BVP over the window. \\
+\texttt{BVP\_std} & Std of wrist BVP over the window (often increases with motion artifacts). \\
+\texttt{BVP\_min} & Min of wrist BVP over the window. \\
+\texttt{BVP\_max} & Max of wrist BVP over the window. \\
+
+\texttt{TEMP\_mean} & Mean of wrist temperature over the window. \\
+\texttt{TEMP\_std} & Std of wrist temperature over the window. \\
+\texttt{TEMP\_min} & Min of wrist temperature over the window. \\
+\texttt{TEMP\_max} & Max of wrist temperature over the window. \\
+
+\texttt{ACC\_x\_mean} & Mean of wrist ACC x-axis over the window. \\
+\texttt{ACC\_x\_std} & Std of wrist ACC x-axis over the window. \\
+\texttt{ACC\_x\_min} & Min of wrist ACC x-axis over the window. \\
+\texttt{ACC\_x\_max} & Max of wrist ACC x-axis over the window. \\
+
+\texttt{ACC\_y\_mean} & Mean of wrist ACC y-axis over the window. \\
+\texttt{ACC\_y\_std} & Std of wrist ACC y-axis over the window. \\
+\texttt{ACC\_y\_min} & Min of wrist ACC y-axis over the window. \\
+\texttt{ACC\_y\_max} & Max of wrist ACC y-axis over the window. \\
+
+\texttt{ACC\_z\_mean} & Mean of wrist ACC z-axis over the window. \\
+\texttt{ACC\_z\_std} & Std of wrist ACC z-axis over the window. \\
+\texttt{ACC\_z\_min} & Min of wrist ACC z-axis over the window. \\
+\texttt{ACC\_z\_max} & Max of wrist ACC z-axis over the window. \\
+
+\texttt{Resp\_mean} & Mean of chest respiration signal (Resp) over the window. \\
+\texttt{Resp\_std} & Std of chest respiration signal over the window. \\
+\texttt{Resp\_min} & Min of chest respiration signal over the window. \\
+\texttt{Resp\_max} & Max of chest respiration signal over the window. \\
+
+\texttt{net\_acc\_mean} & Mean of acceleration magnitude (derived from ACC x/y/z) over the window. \\
+\texttt{net\_acc\_std} & Std of acceleration magnitude over the window. \\
+\texttt{net\_acc\_min} & Min of acceleration magnitude over the window. \\
+\texttt{net\_acc\_max} & Max of acceleration magnitude over the window. \\
+
+\texttt{BVP\_peak\_freq} & Dominant frequency of the BVP window (periodogram peak); proxy for periodicity/heart-rate band structure. \\
+\texttt{TEMP\_slope} & Linear trend (slope) of temperature over the window. \\
+
+\texttt{subject} & Subject id (integer). \\
+\texttt{label} & Target class for the window (0=amusement, 1=baseline, 2=stress). \\
+
+\texttt{age} & Subject age (from readme). \\
+\texttt{height} & Subject height (from readme). \\
+\texttt{weight} & Subject weight (from readme). \\
+
+\texttt{gender\_ female} & One-hot: subject gender is female. \\
+\texttt{gender\_ male} & One-hot: subject gender is male. \\
+\texttt{coffee\_today\_YES} & One-hot: drank coffee today. \\
+\texttt{sport\_today\_YES} & One-hot: did sports today. \\
+\texttt{smoker\_NO} & One-hot: not a smoker. \\
+\texttt{smoker\_YES} & One-hot: is a smoker. \\
+\texttt{feel\_ill\_today\_YES} & One-hot: feels ill today. \\
+
+\end{longtable}
+
+\section{EDA scripts and plots (and how they inform modeling)}
+This section explains each EDA script, the plots it generates, and how those plots are used for
+model selection, training choices, and data-quality decisions.
+
+\subsection{\texttt{eda\_m14.py}: dataset-level EDA on engineered windows}
+\texttt{eda\_m14.py} loads \texttt{m14\_merged.csv}, maps numeric labels to names, selects sensor-window feature columns,
+and produces dataset-level plots in \texttt{eda\_outputs\_m14/}.
+
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/01_label_counts.png}}
+    \caption{Class balance across all windows.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/02_windows_per_subject_stacked.png}}
+    \caption{Windows per subject, split by label.}
+  \end{subfigure}
+  \caption{Global dataset composition plots.}
+  \label{fig:global_composition}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+\begin{itemize}
+  \item Figure~\ref{fig:global_composition}(a) guides choices like class weighting, stratified sampling, and evaluation metrics.
+  \item Figure~\ref{fig:global_composition}(b) confirms the protocol yields a comparable number of windows per subject and label,
+        and motivates LOSO evaluation to avoid leakage across the same subject.
+\end{itemize}
+
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/03_box_eda_mean_by_label.png}}
+    \caption{EDA mean by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}}
+    \caption{EDA phasic mean by label.}
+  \end{subfigure}
+  \caption{EDA-based separability checks.}
+  \label{fig:eda_separability}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+\begin{itemize}
+  \item If stress windows show systematically higher EDA (especially phasic activity), EDA is a high-value modality for the classifier.
+  \item Large overlap suggests the need for multi-modal fusion (e.g., add BVP/Resp/TEMP/ACC) or more expressive models.
+\end{itemize}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.62\linewidth]{\detokenize{eda_outputs_m14/05_box_net_acc_mean_by_label.png}}
+  \caption{Movement confound check: net acceleration magnitude by label.}
+  \label{fig:net_acc}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+If net acceleration differs strongly by label, a model can ``cheat'' by learning movement rather than stress physiology.
+This motivates: per-subject normalization, artifact handling, excluding extreme-motion windows, and/or running ablations
+(physiology-only vs motion-only vs fused).
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.72\linewidth]{\detokenize{eda_outputs_m14/06_corr_heatmap_subset.png}}
+  \caption{Feature correlation heatmap (subset).}
+  \label{fig:corr}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+Correlation highlights redundancy and potential feature leakage:
+highly correlated features may be removed (feature selection) or handled with regularization; it also informs dimensionality reduction.
+
+\begin{figure}[!ht]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/07_pca_scatter_by_label.png}}
+    \caption{PCA colored by label.}
+  \end{subfigure}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14/08_pca_scatter_by_subject.png}}
+    \caption{PCA colored by subject.}
+  \end{subfigure}
+  \caption{2D PCA projections of standardized window features.}
+  \label{fig:pca}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+\begin{itemize}
+  \item If samples separate mainly by \textbf{subject} rather than \textbf{label}, generalization is hard and LOSO is mandatory.
+  \item Strong subject clustering motivates normalization strategies (global vs per-subject) and domain generalization techniques.
+\end{itemize}
+
+\subsection{\texttt{eda\_m14\_window\_timeseries.py}: window-index timelines and outlier windows}
+\texttt{eda\_m14\_window\_timeseries.py} treats windows as a sequence (within a subject) and plots features vs window index.
+It also exports top outlier windows based on a robust z-score (median/MAD).
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_label_timeline.png}}
+  \caption{Subject 2: label segments across window index (order of windows for that subject).}
+  \label{fig:label_timeline}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.78\linewidth]{\detokenize{eda_outputs_m14_timeseries/subject_02_feature_traces.png}}
+  \caption{Subject 2: feature traces across windows with robust outliers marked (red points).}
+  \label{fig:feature_traces}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+\begin{itemize}
+  \item Identifies windows that are unusually high/low in key features (potential artifacts or rare events).
+  \item Guides cleaning rules (drop extreme windows) or robust scaling (e.g., RobustScaler) before training.
+  \item Helps verify label transitions and whether certain segments contain systematic feature shifts.
+\end{itemize}
+
+\subsection{\texttt{plot\_wesad\_raw\_timeseries.py}: raw signal inspection with label overlay}
+\texttt{plot\_wesad\_raw\_timeseries.py} loads the raw \texttt{.pkl} recording and plots raw wrist signals
+(EDA, BVP, TEMP, ACC magnitude) over real time, shading the background by protocol label.
+This is used to visually diagnose spikes and artifacts that are not visible once data is summarized into windows.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA.png}}
+  \caption{Raw wrist EDA for Subject 2 with baseline/stress/amusement overlay.}
+  \label{fig:raw_eda}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
+  \caption{Raw wrist BVP for Subject 2 with baseline/stress/amusement overlay (motion artifacts appear as large spikes).}
+  \label{fig:raw_bvp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
+  \caption{Raw wrist acceleration magnitude for Subject 2 with label overlay (used to confirm movement artifacts).}
+  \label{fig:raw_acc}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
+  \caption{Raw wrist temperature for Subject 2 with label overlay (typically slow-varying; useful for drift).}
+  \label{fig:raw_temp}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}}
+  \caption{Combined raw EDA + BVP view for Subject 2 with label overlay.}
+  \label{fig:raw_combined}
+\end{figure}
+
+\paragraph{Purpose and modeling use.}
+\begin{itemize}
+  \item Confirms whether spikes in BVP co-occur with ACC bursts (a strong indicator of motion artifact).
+  \item Motivates artifact-aware preprocessing (filtering, peak rejection) or dropping extreme windows.
+  \item Ensures the label overlay aligns with protocol segments, preventing label/feature misalignment.
+\end{itemize}
+
+\section{How these results feed into model selection and training}
+Based on the transformation and EDA outputs, the main modeling decisions supported by this report are:
+\begin{itemize}
+  \item \textbf{Evaluation}: use LOSO cross-validation because subject effects are strong (see PCA-by-subject).
+  \item \textbf{Class imbalance}: consider class-weighted loss or balanced sampling if label counts differ.
+  \item \textbf{Feature scaling}: use standardization (and potentially per-subject normalization) due to cross-subject distribution shift.
+  \item \textbf{Confound control}: explicitly analyze motion (net\_acc, ACC) and run modality ablations to ensure the model learns stress physiology.
+  \item \textbf{Robustness}: handle outliers via robust scaling, clipping, or window-quality filtering informed by raw-signal inspection.
+\end{itemize}
+
+\end{document}
+
+\\documentclass[11pt]{article}
+
+\\usepackage[margin=1in]{geometry}
+\\usepackage{graphicx}
+\\usepackage{subcaption}
+\\usepackage{booktabs}
+\\usepackage{longtable}
+\\usepackage{array}
+\\usepackage{xcolor}
+\\usepackage[hidelinks]{hyperref}
+
+\\title{WESAD: Data Transformation and Exploratory Data Analysis Report}
+\\author{Anishwar Chakraborty}
+\\date{\\today}
+
+\\begin{document}
+\\maketitle
+
+\\section{What is WESAD and what does it contain?}
+WESAD (Wearable Stress and Affect Detection) is a multimodal wearable-sensing dataset collected to study stress and affect.
+Subjects follow a lab protocol that includes (at minimum) three key conditions:
+\\textbf{baseline} (rest), \\textbf{stress} (stress induction), and \\textbf{amusement} (positive affect).
+
+\\subsection{Modalities}
+Each subject is stored as a Python pickle file (\\texttt{.pkl}) containing:
+\\begin{itemize}
+  \\item \\textbf{Wrist (Empatica E4)}: acceleration (ACC), blood volume pulse (BVP), electrodermal activity (EDA), and skin temperature (TEMP).
+  \\item \\textbf{Chest (RespiBAN)}: signals such as respiration (Resp) and additional chest channels (e.g., ECG/EMG/EDA/Temp) depending on the recording.
+  \\item \\textbf{A high-frequency label stream}: per-sample protocol labels indicating which condition the subject is in over time.
+  \\item \\textbf{Subject-level metadata}: demographics and questionnaire-like fields contained in per-subject readme text files (e.g., age, gender, smoking).
+\\end{itemize}
+
+\\subsection{Why WESAD is suitable for modeling}
+WESAD enables subject-independent stress detection because:
+\\begin{itemize}
+  \\item it provides \\textbf{physiological} (EDA/BVP/TEMP/Resp) and \\textbf{movement} (ACC) channels,
+  \\item it supports \\textbf{window-based} feature extraction for classical ML or deep learning,
+  \\item it supports \\textbf{leave-one-subject-out (LOSO)} evaluation for generalization across subjects.
+\\end{itemize}
+
+\\section{Data transformation: \\texttt{data\\_wrangling.py}}
+The goal of \\texttt{data\\_wrangling.py} is to transform raw subject \\texttt{.pkl} recordings into a single tabular dataset of
+\\textbf{fixed-length windows} with \\textbf{engineered features} and \\textbf{labels} suitable for EDA and model training.
+
+\\subsection{Inputs and sampling rates}
+The script uses (see \\texttt{fs\\_dict} and \\texttt{WINDOW\\_IN\\_SECONDS}):
+\\begin{itemize}
+  \\item Wrist ACC at 32 Hz, wrist BVP at 64 Hz, wrist EDA at 4 Hz, wrist TEMP at 4 Hz.
+  \\item A label stream at 700 Hz (and chest Resp is also treated as 700 Hz in this pipeline).
+  \\item Window length = 30 seconds.
+\\end{itemize}
+
+\\subsection{Step-by-step transformation}
+For each subject \\texttt{S\\{id\\}}:
+\\begin{enumerate}
+  \\item \\textbf{Load raw data} via \\texttt{SubjectData}, reading \\texttt{data/WESAD/S\\{id\\}/S\\{id\\}.pkl}.
+        The pipeline uses wrist sensors and additionally injects chest \\texttt{Resp} into the wrist dictionary.
+  \\item \\textbf{Preprocess and align signals} in \\texttt{compute\\_features}:
+  \\begin{itemize}
+    \\item EDA is low-pass filtered (to reduce high-frequency noise).
+    \\item ACC is filtered (FIR smoothing) to reduce jitter.
+    \\item Each sensor is assigned a time index based on its sampling rate, then all sensors are outer-joined into one frame.
+    \\item The high-frequency label stream is joined and then forward/backward filled to cover all timestamps.
+    \\item cvxEDA decomposition is applied to the filtered EDA to produce:
+          \\texttt{EDA\\_phasic}, \\texttt{EDA\\_tonic}, and \\texttt{EDA\\_smna}.
+  \\end{itemize}
+  \\item \\textbf{Split into protocol conditions} using the raw WESAD label convention inside \\texttt{compute\\_features}:
+        baseline = 1, stress = 2, amusement = 3.
+  \\item \\textbf{Window the aligned data} into 30s windows in \\texttt{get\\_samples}:
+  \\begin{itemize}
+    \\item Window length is computed in label-samples: \\(700 \\times 30\\).
+    \\item For each window, compute \\texttt{net\\_acc} (ACC magnitude) and then compute per-signal statistics:
+          \\texttt{mean}, \\texttt{std}, \\texttt{min}, \\texttt{max}.
+    \\item Add two additional engineered features:
+          \\texttt{BVP\\_peak\\_freq} (dominant frequency) and \\texttt{TEMP\\_slope} (linear trend).
+  \\end{itemize}
+  \\item \\textbf{Remap labels for modeling} in \\texttt{make\\_patient\\_data}:
+        windows are labeled as \\texttt{baseline=1}, \\texttt{stress=2}, \\texttt{amusement=0}.
+        (This is a project-specific remap; the raw label value for amusement is 3.)
+  \\item \\textbf{Save per-subject feature CSVs} to \\texttt{data/subject\\_feats/S\\{id\\}\\_feats\\_4.csv}.
+  \\item \\textbf{Combine subjects} in \\texttt{combine\\_files} into \\texttt{data/may14\\_feats4.csv}.
+\\end{enumerate}
+
+\\subsection{Why these transformations are useful for modeling}
+\\begin{itemize}
+  \\item \\textbf{Windowing} converts variable-length signals into a supervised learning dataset (each row is a labeled example).
+  \\item \\textbf{Summary features} make it easy to train baselines (MLP/trees/logistic regression) and perform fast EDA.
+  \\item \\textbf{EDA phasic/tonic decomposition} helps separate fast arousal-related responses from slow drift.
+  \\item \\textbf{Motion magnitude (net\\_acc)} is critical to detect confounding from movement artifacts.
+\\end{itemize}
+
+\\section{Metadata parsing and final dataset: \\texttt{readme\\_parser.py}}
+The goal of \\texttt{readme\\_parser.py} is to extract subject-level metadata from each \\texttt{S\\{id\\}\\_readme.txt},
+one-hot encode categorical fields, and merge them into the window-feature dataset.
+
+\\subsection{What it extracts}
+The parser searches for keys like \\texttt{Age}, \\texttt{Height}, \\texttt{Weight}, \\texttt{Gender}, and yes/no questionnaire fields
+(coffee today, sport today, smoker, feel ill today). It then:
+\\begin{itemize}
+  \\item saves a combined metadata table (\\texttt{data/WESAD/readmes.csv}),
+  \\item one-hot encodes categories using \\texttt{pd.get\\_dummies},
+  \\item constructs a numeric \\texttt{subject} id from the folder name (e.g., ``S2'' \\(\\rightarrow 2\\)),
+  \\item merges metadata with \\texttt{data/may14\\_feats4.csv} on \\texttt{subject},
+  \\item outputs \\texttt{data/m14\\_merged.csv}.
+\\end{itemize}
+
+\\subsection{Why this matters}
+Subject metadata can be used to:
+\\begin{itemize}
+  \\item perform stratified EDA (e.g., compare feature distributions by smoker status),
+  \\item analyze covariates and potential confounds,
+  \\item optionally augment models with subject-level covariates (with care to avoid leakage in evaluation).
+\\end{itemize}
+
+\\section{Final dataset: \\texttt{data/m14\\_merged.csv}}
+\\subsection{What one row represents}
+Each row in \\texttt{m14\\_merged.csv} is one \\textbf{30-second window} for a specific \\textbf{subject}, with:
+\\begin{itemize}
+  \\item window-level sensor features (summary statistics and engineered features),
+  \\item a window label (target),
+  \\item subject-level metadata (repeated for all windows of that subject).
+\\end{itemize}
+
+\\subsection{Label meanings in \\texttt{m14\\_merged.csv}}
+The project label mapping used in this CSV is:
+\\begin{center}
+\\begin{tabular}{cl}
+\\toprule
+\\textbf{Label value} & \\textbf{Meaning} \\\\
+\\midrule
+0 & amusement \\\\
+1 & baseline \\\\
+2 & stress \\\\
+\\bottomrule
+\\end{tabular}
+\\end{center}
+
+\\subsection{Sample rows (first 4 windows)}
+The following are sample lines (header + 4 rows) directly from \\texttt{data/m14\\_merged.csv}.
+They are shown verbatim to preserve the wide set of columns.
+\\begin{small}
+\\begin{verbatim}
+,EDA_mean,EDA_std,EDA_min,EDA_max,EDA_phasic_mean,EDA_phasic_std,EDA_phasic_min,EDA_phasic_max,EDA_smna_mean,EDA_smna_std,EDA_smna_min,EDA_smna_max,EDA_tonic_mean,EDA_tonic_std,EDA_tonic_min,EDA_tonic_max,BVP_mean,BVP_std,BVP_min,BVP_max,TEMP_mean,TEMP_std,TEMP_min,TEMP_max,ACC_x_mean,ACC_x_std,ACC_x_min,ACC_x_max,ACC_y_mean,ACC_y_std,ACC_y_min,ACC_y_max,ACC_z_mean,ACC_z_std,ACC_z_min,ACC_z_max,Resp_mean,Resp_std,Resp_min,Resp_max,net_acc_mean,net_acc_std,net_acc_min,net_acc_max,BVP_peak_freq,TEMP_slope,subject,label,age,height,weight,gender_ female,gender_ male,coffee_today_YES,sport_today_YES,smoker_NO,smoker_YES,feel_ill_today_YES
+0,1.3979684884184072,0.1421283950003331,1.109298662480257,1.678399464596154,1.8286466800415988,1.0941151699995388,0.3703718448675747,4.327158402584045,1.2872297863894322,1.96107552424159,5.86535549018663e-08,11.710735943358904,1.2278044130911083,1.0017936627320914,-0.5999062719487944,2.550225067587716,-0.181673261729791,107.67879846954864,-358.13,554.77,35.81709090909091,0.0127319186087378,35.79,35.84,2.366352592827641e-05,8.94181485553418e-06,-1.9310795279339348e-05,7.007060001360278e-05,0.0214135759067394,0.0170525491050647,-0.0412430914886915,0.0522686511839442,2.030445688277317e-05,7.672512318672817e-06,-1.656960215099968e-05,6.012398494791312e-05,0.0295100101555683,0.011151045199089,-0.024081861956356,0.0873827562416348,0.0256889686507238,0.0094435480815385,5.33266539833442e-05,0.0522686573775084,0.1356698699830412,-0.0001690598020873,2,1,27,175,80,False,True,False,False,True,False,False
+1,1.2101317674035457,0.092299131682188,1.014137872636249,1.4857995814446945,2.1109571853194464,1.2291722511400092,0.540783574244884,4.461295191018592,1.4692771168315963,2.867105708678988,3.4907387203020335e-08,17.430256888008586,0.3758003884346144,1.1776194651315297,-1.2149235778082526,1.8705673636050693,-0.8301470588235295,118.77568459744305,-392.28,438.16,35.79756756756757,0.0300368324263933,35.75,35.87,1.3913883618691409e-05,1.6702213411614888e-05,-3.034553543896184e-05,5.738064883003692e-05,0.0290941071450154,0.0159089807077325,-0.0047809503390381,0.0529974731597957,1.1938789293866704e-05,1.4331311956252988e-05,-2.603794623728521e-05,4.923538924868476e-05,0.017351549728282,0.020828784725114,-0.0378429259314166,0.0715575326703151,0.0291658493082437,0.0157769470810625,5.431418461266541e-05,0.0529974765306299,0.0950226244343891,-0.0007886977886977,2,1,27,175,80,False,True,False,False,True,False,False
+2,1.010977164701998,0.1027831346412562,0.8322161167473113,1.1909666436032378,0.1530671558713177,0.12971226066199,0.0069728664445025,0.5452556472237626,0.1052543513378176,0.2464066245504445,5.303034544823505e-08,1.301887673913666,1.7274534403513746,0.2947030266481896,1.1367540494971722,2.0369006233903604,0.9396834369700398,42.20196927852661,-240.61,209.89,35.71290909090909,0.0277388031645353,35.66,35.75,1.6710461877882547e-05,8.853249473518395e-06,2.206948031924497e-06,4.358722363050881e-05,0.0322421231909387,0.0139468930490651,-0.0102793608635888,0.04198394359549,1.4338389541739969e-05,7.596518910678744e-06,1.8936688172571063e-06,3.739995914082785e-05,0.0208390711179392,0.0110405982043918,0.0027522127950121,0.0543562027014893,0.0326904451685088,0.0128597363533526,5.5301715241986593e-05,0.0419839458678118,0.07687959299039,-0.0007169938913058,2,1,27,175,80,False,True,False,False,True,False,False
+3,0.7751874460203967,0.0466014846677679,0.6939961352625406,0.876819417928938,0.1782723846197622,0.1271378479148265,0.0028143930883128,0.362001176673944,0.1112683500138614,0.201946303798118,3.1350842810695674e-08,1.120160175330418,0.9872456458692074,0.0426408310487595,0.9123845529294374,1.127028011983083,0.1074038461538463,41.61864338063139,-289.26,145.36,35.70081081081081,0.0195929085100219,35.66,35.73,2.762367447538074e-05,2.5555057146194463e-06,1.1034740159622484e-05,3.255248347088633e-05,0.0182201709604528,0.0041485833031746,0.0041637412447512,0.0330512821426477,2.370245706532304e-05,2.1927482723176064e-06,9.468344086285533e-06,2.793161505454232e-05,0.0344485820402832,0.0031868876945729,0.0137610639750605,0.0405951387264287,0.0182202107540083,0.0041485695609252,0.0041639195255542,0.0330512930887862,0.1402714932126696,7.528957528957787e-05,2,1,27,175,80,False,True,False,False,True,False,False
+\\end{verbatim}
+\\end{small}
+
+\\subsection{Column-by-column description}
+The columns can be grouped by (1) window-level sensor features, (2) engineered features, (3) identifiers/target, and (4) subject metadata.
+Table~\\ref{tab:columns} lists \\emph{every} header and its meaning.
+
+\\renewcommand{\\arraystretch}{1.1}
+\\begin{longtable}{@{}p{0.29\\textwidth}p{0.66\\textwidth}@{}}
+\\caption{\\label{tab:columns}Column headers in \\texttt{m14\\_merged.csv} and their meaning.}\\\\
+\\toprule
+\\textbf{Column} & \\textbf{Meaning} \\\\
+\\midrule
+\\endfirsthead
+\\toprule
+\\textbf{Column} & \\textbf{Meaning} \\\\
+\\midrule
+\\endhead
+\\bottomrule
+\\endfoot
+
+\\texttt{(blank first column)} & CSV index saved by pandas when exporting; not a signal feature. \\\\
+
+\\texttt{EDA\\_mean} & Mean of wrist EDA over the 30s window. \\\\
+\\texttt{EDA\\_std} & Standard deviation of wrist EDA over the window. \\\\
+\\texttt{EDA\\_min} & Minimum of wrist EDA over the window. \\\\
+\\texttt{EDA\\_max} & Maximum of wrist EDA over the window. \\\\
+
+\\texttt{EDA\\_phasic\\_mean} & Mean of cvxEDA phasic component (fast SCR-related activity) over the window. \\\\
+\\texttt{EDA\\_phasic\\_std} & Std of cvxEDA phasic component over the window. \\\\
+\\texttt{EDA\\_phasic\\_min} & Min of cvxEDA phasic component over the window. \\\\
+\\texttt{EDA\\_phasic\\_max} & Max of cvxEDA phasic component over the window. \\\\
+
+\\texttt{EDA\\_smna\\_mean} & Mean of cvxEDA sparse driver (SMNA) component over the window. \\\\
+\\texttt{EDA\\_smna\\_std} & Std of cvxEDA SMNA component over the window. \\\\
+\\texttt{EDA\\_smna\\_min} & Min of cvxEDA SMNA component over the window. \\\\
+\\texttt{EDA\\_smna\\_max} & Max of cvxEDA SMNA component over the window. \\\\
+
+\\texttt{EDA\\_tonic\\_mean} & Mean of cvxEDA tonic component (slow baseline level) over the window. \\\\
+\\texttt{EDA\\_tonic\\_std} & Std of cvxEDA tonic component over the window. \\\\
+\\texttt{EDA\\_tonic\\_min} & Min of cvxEDA tonic component over the window. \\\\
+\\texttt{EDA\\_tonic\\_max} & Max of cvxEDA tonic component over the window. \\\\
+
+\\texttt{BVP\\_mean} & Mean of wrist BVP over the window. \\\\
+\\texttt{BVP\\_std} & Std of wrist BVP over the window (often increases with motion artifacts). \\\\
+\\texttt{BVP\\_min} & Min of wrist BVP over the window. \\\\
+\\texttt{BVP\\_max} & Max of wrist BVP over the window. \\\\
+
+\\texttt{TEMP\\_mean} & Mean of wrist temperature over the window. \\\\
+\\texttt{TEMP\\_std} & Std of wrist temperature over the window. \\\\
+\\texttt{TEMP\\_min} & Min of wrist temperature over the window. \\\\
+\\texttt{TEMP\\_max} & Max of wrist temperature over the window. \\\\
+
+\\texttt{ACC\\_x\\_mean} & Mean of wrist ACC x-axis over the window. \\\\
+\\texttt{ACC\\_x\\_std} & Std of wrist ACC x-axis over the window. \\\\
+\\texttt{ACC\\_x\\_min} & Min of wrist ACC x-axis over the window. \\\\
+\\texttt{ACC\\_x\\_max} & Max of wrist ACC x-axis over the window. \\\\
+
+\\texttt{ACC\\_y\\_mean} & Mean of wrist ACC y-axis over the window. \\\\
+\\texttt{ACC\\_y\\_std} & Std of wrist ACC y-axis over the window. \\\\
+\\texttt{ACC\\_y\\_min} & Min of wrist ACC y-axis over the window. \\\\
+\\texttt{ACC\\_y\\_max} & Max of wrist ACC y-axis over the window. \\\\
+
+\\texttt{ACC\\_z\\_mean} & Mean of wrist ACC z-axis over the window. \\\\
+\\texttt{ACC\\_z\\_std} & Std of wrist ACC z-axis over the window. \\\\
+\\texttt{ACC\\_z\\_min} & Min of wrist ACC z-axis over the window. \\\\
+\\texttt{ACC\\_z\\_max} & Max of wrist ACC z-axis over the window. \\\\
+
+\\texttt{Resp\\_mean} & Mean of chest respiration signal (Resp) over the window. \\\\
+\\texttt{Resp\\_std} & Std of chest respiration signal over the window. \\\\
+\\texttt{Resp\\_min} & Min of chest respiration signal over the window. \\\\
+\\texttt{Resp\\_max} & Max of chest respiration signal over the window. \\\\
+
+\\texttt{net\\_acc\\_mean} & Mean of acceleration magnitude (derived from ACC x/y/z) over the window. \\\\
+\\texttt{net\\_acc\\_std} & Std of acceleration magnitude over the window. \\\\
+\\texttt{net\\_acc\\_min} & Min of acceleration magnitude over the window. \\\\
+\\texttt{net\\_acc\\_max} & Max of acceleration magnitude over the window. \\\\
+
+\\texttt{BVP\\_peak\\_freq} & Dominant frequency of the BVP window (periodogram peak); proxy for periodicity/heart-rate band structure. \\\\
+\\texttt{TEMP\\_slope} & Linear trend (slope) of temperature over the window. \\\\
+
+\\texttt{subject} & Subject id (integer). \\\\
+\\texttt{label} & Target class for the window (0=amusement, 1=baseline, 2=stress). \\\\
+
+\\texttt{age} & Subject age (from readme). \\\\
+\\texttt{height} & Subject height (from readme). \\\\
+\\texttt{weight} & Subject weight (from readme). \\\\
+
+\\texttt{gender\\_ female} & One-hot: subject gender is female. \\\\
+\\texttt{gender\\_ male} & One-hot: subject gender is male. \\\\
+\\texttt{coffee\\_today\\_YES} & One-hot: drank coffee today. \\\\
+\\texttt{sport\\_today\\_YES} & One-hot: did sports today. \\\\
+\\texttt{smoker\\_NO} & One-hot: not a smoker. \\\\
+\\texttt{smoker\\_YES} & One-hot: is a smoker. \\\\
+\\texttt{feel\\_ill\\_today\\_YES} & One-hot: feels ill today. \\\\
+
+\\end{longtable}
+
+\\section{EDA scripts and plots (and how they inform modeling)}
+This section explains each EDA script, the plots it generates, and how those plots are used for
+model selection, training choices, and data-quality decisions.
+
+\\subsection{\\texttt{eda\\_m14.py}: dataset-level EDA on engineered windows}
+\\texttt{eda\\_m14.py} loads \\texttt{m14\\_merged.csv}, maps numeric labels to names, selects sensor-window feature columns,
+and produces dataset-level plots in \\texttt{eda\\_outputs\\_m14/}.
+
+\\begin{figure}[!ht]
+  \\centering
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/01_label_counts.png}}
+    \\caption{Class balance across all windows.}
+  \\end{subfigure}
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/02_windows_per_subject_stacked.png}}
+    \\caption{Windows per subject, split by label.}
+  \\end{subfigure}
+  \\caption{Global dataset composition plots.}
+  \\label{fig:global_composition}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+\\begin{itemize}
+  \\item Figure~\\ref{fig:global_composition}(a) guides choices like class weighting, stratified sampling, and evaluation metrics.
+  \\item Figure~\\ref{fig:global_composition}(b) confirms the protocol yields a comparable number of windows per subject and label,
+        and motivates LOSO evaluation to avoid leakage across the same subject.
+\\end{itemize}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/03_box_eda_mean_by_label.png}}
+    \\caption{EDA mean by label.}
+  \\end{subfigure}
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/04_box_eda_phasic_mean_by_label.png}}
+    \\caption{EDA phasic mean by label.}
+  \\end{subfigure}
+  \\caption{EDA-based separability checks.}
+  \\label{fig:eda_separability}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+\\begin{itemize}
+  \\item If stress windows show systematically higher EDA (especially phasic activity), EDA is a high-value modality for the classifier.
+  \\item Large overlap suggests the need for multi-modal fusion (e.g., add BVP/Resp/TEMP/ACC) or more expressive models.
+\\end{itemize}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.62\\linewidth]{\\detokenize{eda_outputs_m14/05_box_net_acc_mean_by_label.png}}
+  \\caption{Movement confound check: net acceleration magnitude by label.}
+  \\label{fig:net_acc}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+If net acceleration differs strongly by label, a model can ``cheat'' by learning movement rather than stress physiology.
+This motivates: per-subject normalization, artifact handling, excluding extreme-motion windows, and/or running ablations
+(physiology-only vs motion-only vs fused).
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.72\\linewidth]{\\detokenize{eda_outputs_m14/06_corr_heatmap_subset.png}}
+  \\caption{Feature correlation heatmap (subset).}
+  \\label{fig:corr}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+Correlation highlights redundancy and potential feature leakage:
+highly correlated features may be removed (feature selection) or handled with regularization; it also informs dimensionality reduction.
+
+\\begin{figure}[!ht]
+  \\centering
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/07_pca_scatter_by_label.png}}
+    \\caption{PCA colored by label.}
+  \\end{subfigure}
+  \\begin{subfigure}{0.49\\linewidth}
+    \\centering
+    \\includegraphics[width=\\linewidth]{\\detokenize{eda_outputs_m14/08_pca_scatter_by_subject.png}}
+    \\caption{PCA colored by subject.}
+  \\end{subfigure}
+  \\caption{2D PCA projections of standardized window features.}
+  \\label{fig:pca}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+\\begin{itemize}
+  \\item If samples separate mainly by \\textbf{subject} rather than \\textbf{label}, generalization is hard and LOSO is mandatory.
+  \\item Strong subject clustering motivates normalization strategies (global vs per-subject) and domain generalization techniques.
+\\end{itemize}
+
+\\subsection{\\texttt{eda\\_m14\\_window\\_timeseries.py}: window-index timelines and outlier windows}
+\\texttt{eda\\_m14\\_window\\_timeseries.py} treats windows as a sequence (within a subject) and plots features vs window index.
+It also exports top outlier windows based on a robust z-score (median/MAD).
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_m14_timeseries/subject_02_label_timeline.png}}
+  \\caption{Subject 2: label segments across window index (order of windows for that subject).}
+  \\label{fig:label_timeline}
+\\end{figure}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.78\\linewidth]{\\detokenize{eda_outputs_m14_timeseries/subject_02_feature_traces.png}}
+  \\caption{Subject 2: feature traces across windows with robust outliers marked (red points).}
+  \\label{fig:feature_traces}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+\\begin{itemize}
+  \\item Identifies windows that are unusually high/low in key features (potential artifacts or rare events).
+  \\item Guides cleaning rules (drop extreme windows) or robust scaling (e.g., RobustScaler) before training.
+  \\item Helps verify label transitions and whether certain segments contain systematic feature shifts.
+\\end{itemize}
+
+\\subsection{\\texttt{plot\\_wesad\\_raw\\_timeseries.py}: raw signal inspection with label overlay}
+\\texttt{plot\\_wesad\\_raw\\_timeseries.py} loads the raw \\texttt{.pkl} recording and plots raw wrist signals
+(EDA, BVP, TEMP, ACC magnitude) over real time, shading the background by protocol label.
+This is used to visually diagnose spikes and artifacts that are not visible once data is summarized into windows.
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_wesad_raw/S02_raw_EDA.png}}
+  \\caption{Raw wrist EDA for Subject 2 with baseline/stress/amusement overlay.}
+  \\label{fig:raw_eda}
+\\end{figure}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
+  \\caption{Raw wrist BVP for Subject 2 with baseline/stress/amusement overlay (motion artifacts appear as large spikes).}
+  \\label{fig:raw_bvp}
+\\end{figure}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
+  \\caption{Raw wrist acceleration magnitude for Subject 2 with label overlay (used to confirm movement artifacts).}
+  \\label{fig:raw_acc}
+\\end{figure}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
+  \\caption{Raw wrist temperature for Subject 2 with label overlay (typically slow-varying; useful for drift).}
+  \\label{fig:raw_temp}
+\\end{figure}
+
+\\begin{figure}[!ht]
+  \\centering
+  \\includegraphics[width=0.92\\linewidth]{\\detokenize{eda_outputs_wesad_raw/S02_raw_EDA_BVP_combined.png}}
+  \\caption{Combined raw EDA + BVP view for Subject 2 with label overlay.}
+  \\label{fig:raw_combined}
+\\end{figure}
+
+\\paragraph{Purpose and modeling use.}
+\\begin{itemize}
+  \\item Confirms whether spikes in BVP co-occur with ACC bursts (a strong indicator of motion artifact).
+  \\item Motivates artifact-aware preprocessing (filtering, peak rejection) or dropping extreme windows.
+  \\item Ensures the label overlay aligns with protocol segments, preventing label/feature misalignment.
+\\end{itemize}
+
+\\section{How these results feed into model selection and training}
+Based on the transformation and EDA outputs, the main modeling decisions supported by this report are:
+\\begin{itemize}
+  \\item \\textbf{Evaluation}: use LOSO cross-validation because subject effects are strong (see PCA-by-subject).
+  \\item \\textbf{Class imbalance}: consider class-weighted loss or balanced sampling if label counts differ.
+  \\item \\textbf{Feature scaling}: use standardization (and potentially per-subject normalization) due to cross-subject distribution shift.
+  \\item \\textbf{Confound control}: explicitly analyze motion (net\\_acc, ACC) and run modality ablations to ensure the model learns stress physiology.
+  \\item \\textbf{Robustness}: handle outliers via robust scaling, clipping, or window-quality filtering informed by raw-signal inspection.
+\\end{itemize}
+
+\\end{document}
+
