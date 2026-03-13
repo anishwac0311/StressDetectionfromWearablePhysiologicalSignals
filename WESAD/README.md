@@ -1,9 +1,6 @@
 # WESAD
 ###  A Multimodal Dataset for Wearable Stress and Affect Detection
 #### Using only data from the Empatica E4 (EDA, BVP, ACM, TEMP), and RESP from Respiban (currently)
-
-##### Matthew Johnson, 2019
-
 ----------
 
 ### Dataset Information [1]:
