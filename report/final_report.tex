@@ -471,6 +471,7 @@ If movement had differed by label, a classifier could learn motion artifacts (es
 
 % ------------------------------------------------------------------
 \subsection{Correlation and Redundancy}
+\label{sec:corr-redundancy}
 % ------------------------------------------------------------------
 
 \begin{figure}[H]
@@ -635,12 +636,106 @@ Raw inspection prevents misinterpretation of window features and supports the de
 \subsection{Comparative Feature Analysis and Importance Rankings}
 % ------------------------------------------------------------------
 
+\subsubsection{Bivariate Feature Relationships}
+
+To assess whether pairs of features jointly separate the three conditions, we examine scatter plots of the five most informative feature pairs (selected by mutual information and domain knowledge), coloured by label.
+
 \begin{figure}[H]
   \centering
-  \includegraphics[width=0.75\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_01_EDA_phasic_mean_vs_BVP_std.png}}
-  \caption{Example bivariate relationship: EDA\_phasic\_mean vs BVP\_std (coloured by label).}
-  \label{fig:bivar1}
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_01_EDA_phasic_mean_vs_BVP_std.png}}
+    \caption{EDA phasic mean vs.\ BVP std.}
+    \label{fig:bivar1}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_02_EDA_mean_vs_Resp_std.png}}
+    \caption{EDA mean vs.\ Resp std.}
+    \label{fig:bivar2}
+  \end{subfigure}
+  \caption{Bivariate scatter plots (1 of 3). \textbf{(a)}~Stress windows occupy a distinct region with elevated EDA phasic activity and moderate BVP variability, while Baseline and Amusement overlap substantially. \textbf{(b)}~EDA mean vs.\ respiration variability shows Stress windows shifting to higher EDA and broader respiration fluctuations.}
+  \label{fig:bivar-row1}
 \end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_03_net_acc_mean_vs_BVP_std.png}}
+    \caption{Net acceleration mean vs.\ BVP std.}
+    \label{fig:bivar3}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_04_TEMP_mean_vs_EDA_tonic_mean.png}}
+    \caption{Temperature mean vs.\ EDA tonic mean.}
+    \label{fig:bivar4}
+  \end{subfigure}
+  \caption{Bivariate scatter plots (2 of 3). \textbf{(a)}~Acceleration vs.\ BVP variability confirms that high BVP std can occur at any motion level, supporting the hypothesis that BVP spikes reflect both physiological arousal and motion artifacts. \textbf{(b)}~Temperature vs.\ tonic EDA reveals that Stress windows cluster at higher tonic EDA levels across a range of skin temperatures, consistent with sustained sympathetic activation.}
+  \label{fig:bivar-row2}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.55\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_05_net_acc_mean_vs_EDA_std.png}}
+  \caption{Net acceleration mean vs.\ EDA std. The three conditions overlap heavily in this feature plane, reinforcing the finding that acceleration does not confound the EDA-based stress signal---elevated EDA variability during Stress occurs independently of movement intensity.}
+  \label{fig:bivar5}
+\end{figure}
+
+\begin{itemize}
+  \item Across all five bivariate views, \textbf{Stress windows are most separable} when at least one EDA-derived feature is involved, confirming electrodermal activity as the strongest single-modality discriminator.
+  \item \textbf{Baseline and Amusement overlap substantially} in every pair, explaining the low Amusement F1 observed in all models and motivating multivariate/nonlinear classifiers.
+  \item \textbf{Acceleration-based pairs} show no label-dependent structure, further ruling out motion confounding as a driver of classification performance.
+  \item The joint structure visible in pairs like EDA phasic vs.\ BVP std (Figure~\ref{fig:bivar1}) confirms that \textbf{multivariate models can exploit cross-modality interactions} that are invisible in univariate analysis alone.
+\end{itemize}
+
+\subsubsection{Comparative Correlation Structure}
+
+In addition to the full-feature correlation matrices presented in Section~\ref{sec:corr-redundancy}, a focused correlation analysis on the comparative feature subset highlights how inter-feature relationships change with condition.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{\detokenize{eda_outputs_m14_comparative/02_corr_overall_spearman.png}}
+  \caption{Overall Spearman correlation matrix (comparative feature subset). High within-modality correlations (e.g., EDA sub-components) confirm redundancy, while moderate cross-modality correlations (e.g., EDA--BVP, EDA--Resp) indicate complementary predictive information.}
+  \label{fig:comp_corr_overall}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/03_corr_label_1_baseline_spearman.png}}
+    \caption{Baseline.}
+    \label{fig:comp_corr_baseline}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{\detokenize{eda_outputs_m14_comparative/03_corr_label_2_stress_spearman.png}}
+    \caption{Stress.}
+    \label{fig:comp_corr_stress}
+  \end{subfigure}
+  \caption{Condition-specific Spearman correlation (comparative subset). Under Stress, EDA--BVP coupling strengthens and new cross-modality correlations emerge (e.g., Resp--EDA), reflecting the coordinated autonomic response elicited by the Trier Social Stress Test.}
+  \label{fig:comp_corr_stress_vs_base}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.55\linewidth]{\detokenize{eda_outputs_m14_comparative/03_corr_label_0_amusement_spearman.png}}
+  \caption{Spearman correlation within Amusement windows (comparative subset). The correlation structure during Amusement more closely resembles Baseline than Stress, consistent with both being low-arousal conditions and explaining the persistent confusion between these two classes.}
+  \label{fig:comp_corr_amuse}
+\end{figure}
+
+\begin{itemize}
+  \item \textbf{Condition-dependent correlation shifts} are clearly visible: Stress activates stronger cross-modality coupling (EDA--BVP, EDA--Resp), while Baseline and Amusement exhibit weaker, more diffuse correlations.
+  \item The \textbf{structural similarity between Amusement and Baseline} correlation matrices provides a direct explanation for the high confusion rate between these two classes and motivates future work on Amusement-specific feature engineering.
+  \item Models capable of learning feature interactions (tree ensembles, neural networks) are expected to outperform linear models, which cannot exploit these condition-specific coupling patterns.
+\end{itemize}
+
+\subsubsection{Feature Importance Rankings}
 
 \begin{figure}[H]
   \centering
@@ -657,10 +752,10 @@ Raw inspection prevents misinterpretation of window features and supports the de
 \end{figure}
 
 \begin{itemize}
-  \item \textbf{Bivariate plots} show class separation that may be weak in any single feature but stronger in combinations, justifying multivariate approaches.
   \item \textbf{Mutual information} highlights nonlinear predictive features; \textbf{effect size ($\varepsilon^2$)} highlights features with strong distribution shifts across classes.
-  \item \textbf{EDA phasic features, BVP variability, and temperature slope} rank as the top predictors. Acceleration features rank lower, consistent with the absence of motion confounding.
-  \item These rankings guide sensor ablations and informed the decision to retain all sensor channels for deep models.
+  \item \textbf{EDA phasic features, BVP variability, and temperature slope} rank as the top predictors under both metrics, confirming the bivariate and correlation findings.
+  \item Acceleration features rank low under both metrics, consistent with the absence of motion confounding and the bivariate results (Figures~\ref{fig:bivar3},~\ref{fig:bivar5}).
+  \item These rankings guide sensor ablations and informed the decision to retain all sensor channels for deep models while relying primarily on EDA-derived features for interpretable baselines.
 \end{itemize}
 
 % ------------------------------------------------------------------
