@@ -53,7 +53,7 @@ All models are evaluated under Leave-One-Subject-Out (LOSO) cross-validation to 
 
 On engineered features, the MLP achieves the best binary stress detection (Macro-F1 = 0.898), while XGBoost leads 3-class classification (Macro-F1 = 0.677).
 Standalone RNNs and ResNets on raw 30-second windows yield 0.60--0.79 accuracy, indicating that naive end-to-end learning on low-rate wrist signals is insufficient.
-Our improved pipeline---60-second overlapping windows, per-subject normalisation, and hybrid CNN-LSTM with self-attention---raises raw-signal accuracy meaningfully, demonstrating that combining local convolutional feature extraction with temporal recurrent modelling and attention-based pooling bridges much of the gap between hand-crafted and learned representations.
+Our improved pipeline (60-second overlapping windows, per-subject normalisation, and hybrid CNN-LSTM with self-attention) raises raw-signal accuracy meaningfully, demonstrating that combining local convolutional feature extraction with temporal recurrent modelling and attention-based pooling bridges much of the gap between hand-crafted and learned representations.
 \end{abstract}
 
 % ======================================================================
@@ -68,7 +68,7 @@ With the proliferation of wrist-worn wearable devices capable of recording these
 
 The aims of this project are threefold:
 \begin{enumerate}    \item \textbf{Explore and characterise} the WESAD dataset through rigorous exploratory data analysis, identifying class imbalance, inter-subject variability, feature separability, and potential confounds.
-    \item \textbf{Develop and compare} multiple classification pipelines---from interpretable linear baselines through gradient-boosted trees and neural networks on engineered features, to deep sequence models on raw wrist signals---using subject-independent LOSO evaluation.
+    \item \textbf{Develop and compare} multiple classification pipelines, from interpretable linear baselines through gradient-boosted trees and neural networks on engineered features to deep sequence models on raw wrist signals, using subject-independent LOSO evaluation.
     \item \textbf{Investigate improved deep learning architectures} (CNN-LSTM hybrids with attention and multi-scale convolutions) to determine whether end-to-end learning from raw wrist signals can match or exceed hand-crafted feature pipelines.
 \end{enumerate}
 
@@ -114,8 +114,11 @@ We use only the \textbf{wrist-worn Empatica E4} signals:
     \item \textbf{EDA (Electrodermal Activity)} (4\,Hz): skin conductance reflecting sympathetic nervous system activity. EDA is further decomposed into:
     \begin{itemize}
         \item \textbf{Phasic component}: fast skin conductance responses (SCRs), directly linked to arousal events.
-        \item \textbf{Tonic component}: slow baseline level (SCL), capturing longer-term drift.
-        \item \textbf{SMNA / sparse driver}: estimated event-like driver activity from the decomposition.
+        The phasic component isolates rapid, event-driven changes in skin conductance caused by bursts of sympathetic nerve activity (e.g., sweat gland activation during a stressor).
+        Because these transient responses ride on top of a slowly drifting baseline, the phasic signal provides a cleaner measure of acute autonomic arousal than raw EDA alone.
+        In practice, \texttt{EDA\_phasic\_mean} (the average phasic amplitude within a window) emerges as the single most discriminative feature for stress detection, reflecting the sustained elevation of SCR activity throughout the Trier Social Stress Test protocol.
+        \item \textbf{Tonic component}: slow baseline level (SCL), capturing longer-term drift in skin conductance over minutes to hours.
+        \item \textbf{SMNA / sparse driver}: estimated event-like driver activity from the cvxEDA decomposition, representing the underlying neural impulses that generate observed SCRs.
     \end{itemize}
     \item \textbf{BVP (Blood Volume Pulse)} (64\,Hz): optical photoplethysmography signal carrying heart-beat periodicity but highly sensitive to motion artifacts and poor sensor contact.
     \item \textbf{BVP peak frequency}: dominant frequency in the BVP window (from a periodogram), a proxy for heart-rate band behaviour.
@@ -126,15 +129,50 @@ We use only the \textbf{wrist-worn Empatica E4} signals:
 \end{itemize}
 
 \subsection{Data Transformation Pipeline}
-Raw WESAD recordings are multi-rate time series. The transformation pipeline converts them into a window-level feature table:
+\label{sec:data-pipeline}
+Raw WESAD recordings are multi-rate time series stored as per-subject Python pickle files (\texttt{S\{id\}.pkl}).
+Each file contains a dictionary with wrist signals, chest signals, and a 700\,Hz synchronised label stream (1~=~baseline, 2~=~stress, 3~=~amusement).
+The data wrangling script (\texttt{data\_wrangling.py}) converts these into a window-level feature table through the following steps:
+
 \begin{enumerate}
-    \item \textbf{Load raw wrist/chest signals and labels.}
-    \item \textbf{Denoise signals} via smoothing / low-pass filtering to reduce high-frequency noise.
-    \item \textbf{Time-align modalities.} Signals sampled at different rates are aligned onto a consistent timeline; labels are propagated so every aligned time point has an associated class.
-    \item \textbf{EDA decomposition (cvxEDA).} EDA is decomposed into tonic (slow drift) and phasic (fast SCR-like responses) components.
-    \item \textbf{Split into protocol segments} (baseline / stress / amusement) using the synchronised label stream.
-    \item \textbf{Windowing.} The continuous signal is partitioned into \textbf{30-second} fixed windows, creating labelled examples.
-    \item \textbf{Feature extraction per window.} For each sensor channel, compute summary statistics (mean, std, min, max) plus domain-engineered features (BVP dominant frequency, temperature slope, ACC magnitude).
+    \item \textbf{Load raw signals and labels.}
+    For each subject, the pickle file is unpacked to extract the wrist channels (EDA at 4\,Hz, BVP at 64\,Hz, TEMP at 4\,Hz, ACC $x/y/z$ at 32\,Hz), the chest respiration signal (700\,Hz), and the 700\,Hz label array.
+
+    \item \textbf{Signal denoising.}
+    Channel-specific filters suppress high-frequency noise before downstream analysis:
+    \begin{itemize}
+        \item \textbf{EDA}: 6th-order Butterworth low-pass filter with cutoff frequency $f_c = 1.0$\,Hz at sampling rate $f_s = 4$\,Hz, retaining the physiologically relevant sub-1\,Hz band while attenuating sensor noise.
+        \item \textbf{ACC}: FIR low-pass filter with 64 taps and cutoff $f_c = 0.4$\,Hz (normalised by Nyquist at 16\,Hz), isolating slow postural changes from high-frequency vibration.
+        \item \textbf{BVP, TEMP, Resp}: retained unfiltered, as BVP requires its full waveform for peak-frequency estimation and TEMP changes are already slow.
+    \end{itemize}
+
+    \item \textbf{EDA decomposition (cvxEDA).}
+    The filtered EDA signal is decomposed via the convex optimisation framework cvxEDA into three components:
+    \begin{itemize}
+        \item \textbf{Phasic} ($r$): fast skin conductance responses driven by sympathetic nerve bursts.
+        \item \textbf{Tonic} ($t$): slowly drifting baseline skin conductance level.
+        \item \textbf{SMNA} ($p$): sparse driver signal estimating the underlying neural impulse train.
+    \end{itemize}
+    The input EDA is first z-normalised per subject before decomposition to improve numerical stability.
+
+    \item \textbf{Time-alignment across modalities.}
+    Each signal is assigned a time index derived from its native sampling rate and converted to a datetime representation.
+    All channels are then joined on a common time axis via an outer merge, and the 700\,Hz label stream is forward- and back-filled so every aligned time point carries a valid condition label.
+
+    \item \textbf{Segmentation and windowing.}
+    The aligned signal is split into protocol segments (baseline, stress, amusement) using the label stream.
+    Within each segment, the continuous signal is partitioned into \textbf{30-second non-overlapping windows} of $700 \times 30 = 21{,}000$ label-rate samples.
+    Each window is assigned a single label by majority vote over the label samples it contains.
+
+    \item \textbf{Feature extraction per window.}
+    For each window, summary statistics are computed per channel:
+    \begin{itemize}
+        \item \textbf{Mean, standard deviation, minimum, maximum} for EDA, EDA phasic, EDA tonic, EDA SMNA, BVP, TEMP, ACC $x$/$y$/$z$, Resp, and net acceleration magnitude $\text{net\_acc} = \sqrt{\text{ACC}_x^2 + \text{ACC}_y^2 + \text{ACC}_z^2}$.
+        \item \textbf{BVP peak frequency}: dominant frequency from a periodogram computed at $f_s = 8$\,Hz, serving as a proxy for heart-rate band behaviour.
+        \item \textbf{TEMP slope}: linear regression slope of temperature across the window, capturing thermal drift.
+    \end{itemize}
+    This yields \textbf{46 sensor features} per window (4 statistics $\times$ 11 channels + 2 engineered features).
+    Per-subject feature files are saved individually, then concatenated into a single sensor-only feature table (\texttt{may14\_feats4.csv}) with 1{,}178 rows $\times$ 46 columns plus subject and label identifiers.
 \end{enumerate}
 
 % --- DATA PIPELINE FIGURE ---
@@ -205,7 +243,37 @@ Window features compress high-frequency signals into stable vectors that capture
 \end{itemize}
 
 \subsection{Metadata Parsing and Merging}
-Subjects differ in demographic and contextual factors (age, gender, smoking, etc.). These fields are extracted from per-subject metadata and encoded as model-ready columns (e.g., one-hot indicators) to support interpretation and confound analysis.
+\label{sec:metadata-merge}
+Subjects differ in demographic and contextual factors that may influence physiological baselines.
+The metadata parser (\texttt{readme\_parser.py}) extracts these fields automatically from the per-subject \texttt{S\{id\}\_readme.txt} files distributed with WESAD.
+For each subject, the following fields are parsed by searching for known key phrases and splitting on the appropriate delimiter (\texttt{:} or \texttt{?}):
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Field} & \textbf{Search key} & \textbf{Type} \\
+\midrule
+Age       & ``Age''        & Numeric \\
+Height    & ``Height''     & Numeric \\
+Weight    & ``Weight''     & Numeric \\
+Gender    & ``Gender''     & Categorical \\
+Coffee today      & ``Did you drink coffee today''   & Yes/No \\
+Sport today       & ``Did you do any sports today''  & Yes/No \\
+Smoker            & ``Are you a smoker''             & Yes/No \\
+Feel ill today    & ``Do you feel ill today''        & Yes/No \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The parsed metadata is collected into a single demographics table (\texttt{readmes.csv}) with one row per subject.
+Categorical fields are one-hot encoded via \texttt{pd.get\_dummies}, producing binary indicator columns (e.g., \texttt{gender\_female}, \texttt{gender\_male}, \texttt{coffee\_today\_YES}, \texttt{smoker\_YES}).
+This demographics table is then merged with the sensor-only feature table on the shared \texttt{subject} identifier, yielding the final merged dataset (\texttt{m14\_merged.csv}) with 1{,}178 rows and up to 58 columns.
+Two feature subsets are defined from this merged file for modelling:
+\begin{itemize}
+    \item \textbf{Sensor-only} (26 selected features): the most informative sensor-derived statistics, used as the default feature set.
+    \item \textbf{Sensor+demographics} (29 features): sensor features augmented with age, height, weight, and the binary demographic indicators, used to test whether subject-level covariates improve classification.
+\end{itemize}
 
 \subsection{Engineered Feature Dataset}
 Each row corresponds to one \textbf{30-second window} from one subject, represented by engineered window features plus a class label and metadata.
@@ -417,7 +485,7 @@ The EDA is designed to answer three modelling-critical questions:
 
 The dataset is moderately imbalanced: Baseline (628 windows, 53.3\%) outnumbers Amusement (195 windows, 16.6\%) by 3.2:1.
 The per-subject stacked bar chart confirms that every subject contributes all three classes in roughly consistent proportions, reflecting the standardised protocol.
-However, the imbalance means that accuracy alone is misleading---a model that always predicts Baseline would achieve 53\% accuracy.
+However, the imbalance means that accuracy alone is misleading; a model that always predicts Baseline would achieve 53\% accuracy.
 This motivates the use of \textbf{class-weighted loss functions} and \textbf{Macro-F1} as the primary evaluation metric.
 
 % ------------------------------------------------------------------
@@ -444,7 +512,7 @@ This motivates the use of \textbf{class-weighted loss functions} and \textbf{Mac
 \begin{itemize}
   \item \textbf{EDA mean} is elevated during Stress relative to Baseline and Amusement, consistent with sympathetic activation increasing skin conductance.
   \item \textbf{EDA phasic mean} shows the sharpest class separation, confirming that rapid skin conductance responses are a strong stress indicator.
-  \item Substantial \textbf{inter-class overlap} in all single features indicates that no individual modality is sufficient---multivariate models are needed.
+  \item Substantial \textbf{inter-class overlap} in all single features indicates that no individual modality is sufficient; multivariate models are needed.
   \item Presence of \textbf{outliers} (especially in BVP features) may correspond to motion artifacts or rare physiological events, motivating robust scaling.
 \end{itemize}
 
@@ -481,7 +549,7 @@ If movement had differed by label, a classifier could learn motion artifacts (es
   \label{fig:corr_subset}
 \end{figure}
 
-Large blocks of high correlation among EDA sub-components (EDA mean, tonic, phasic, SMNA---all $r > 0.7$) indicate feature redundancy.
+Large blocks of high correlation among EDA sub-components (EDA mean, tonic, phasic, SMNA, all with $r > 0.7$) indicate feature redundancy.
 This motivates regularisation (L2 in Logistic Regression, dropout in MLP) or feature selection to prevent overfitting to redundant predictors.
 
 \subsubsection{Additional Correlation Analysis}
@@ -598,21 +666,21 @@ Outlier windows can dominate training and degrade generalisation; these plots mo
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_BVP.png}}
-  \caption{Raw BVP with protocol labels overlaid---spikes often indicate motion artifacts (Subject~2).}
+  \caption{Raw BVP with protocol labels overlaid; spikes often indicate motion artifacts (Subject~2).}
   \label{fig:raw_bvp}
 \end{figure}
 
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_ACC_mag.png}}
-  \caption{Raw acceleration magnitude with labels overlaid---used to validate motion artifacts (Subject~2).}
+  \caption{Raw acceleration magnitude with labels overlaid, used to validate motion artifacts (Subject~2).}
   \label{fig:raw_acc}
 \end{figure}
 
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.92\linewidth]{\detokenize{eda_outputs_wesad_raw/S02_raw_TEMP.png}}
-  \caption{Raw temperature with labels overlaid---slow trends and drift (Subject~2).}
+  \caption{Raw temperature with labels overlaid, showing slow trends and drift (Subject~2).}
   \label{fig:raw_temp}
 \end{figure}
 
@@ -625,7 +693,7 @@ Outlier windows can dominate training and degrade generalisation; these plots mo
 
 \begin{itemize}
   \item \textbf{EDA} shows clear sustained elevation during the Stress segment, confirming sympathetic arousal.
-  \item \textbf{BVP} spikes co-occur with \textbf{ACC} bursts, confirming motion artifact contamination---a key reason to include acceleration features and to avoid over-reliance on BVP alone.
+  \item \textbf{BVP} spikes co-occur with \textbf{ACC} bursts, confirming motion artifact contamination, which is a key reason to include acceleration features and to avoid over-reliance on BVP alone.
   \item \textbf{Temperature} drifts slowly and is more informative through its slope (trend) than through instantaneous values.
   \item One segment may be systematically noisier than others (data quality differs by condition), supporting artifact-aware preprocessing.
 \end{itemize}
@@ -681,7 +749,7 @@ To assess whether pairs of features jointly separate the three conditions, we ex
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.55\linewidth]{\detokenize{eda_outputs_m14_comparative/01_bivariate_05_net_acc_mean_vs_EDA_std.png}}
-  \caption{Net acceleration mean vs.\ EDA std. The three conditions overlap heavily in this feature plane, reinforcing the finding that acceleration does not confound the EDA-based stress signal---elevated EDA variability during Stress occurs independently of movement intensity.}
+  \caption{Net acceleration mean vs.\ EDA std. The three conditions overlap heavily in this feature plane, reinforcing the finding that acceleration does not confound the EDA-based stress signal: elevated EDA variability during Stress occurs independently of movement intensity.}
   \label{fig:bivar5}
 \end{figure}
 
@@ -769,7 +837,7 @@ If windows are randomly split, windows from the same subject appear in both trai
 Because subjects have strong physiological ``signatures'' (as confirmed by the PCA analysis in Figure~\ref{fig:pca}), the model can partially memorise subject-specific patterns, inflating test accuracy.
 
 \textbf{Leave-One-Subject-Out (LOSO)} cross-validation holds out one subject for testing and trains on the remaining 14 subjects, repeating this for each of the 15 subjects.
-This directly measures subject-independent performance---the realistic wearable deployment setting---and discourages leakage caused by within-subject correlations.
+This directly measures subject-independent performance (the realistic wearable deployment setting) and discourages leakage caused by within-subject correlations.
 
 % ------------------------------------------------------------------
 \subsection{How the EDA Informs Model Selection and Training}
@@ -796,6 +864,72 @@ All models are evaluated using LOSO cross-validation: for each fold $k \in \{1, 
 Features are standardised per fold (fit on training data, applied to test) to prevent information leakage.
 We report mean and standard deviation of accuracy and Macro-F1 across folds.
 
+\textbf{Macro-F1} is the unweighted average of per-class F1 scores:
+\begin{equation}
+\text{Macro-F1} = \frac{1}{C} \sum_{c=1}^{C} F_{1,c}, \quad \text{where } F_{1,c} = \frac{2 \cdot \text{Precision}_c \cdot \text{Recall}_c}{\text{Precision}_c + \text{Recall}_c}
+\end{equation}
+Unlike accuracy, Macro-F1 gives equal weight to every class regardless of its sample size.
+This makes it the appropriate primary metric for our imbalanced dataset (53.3\% Baseline vs.\ 16.6\% Amusement), because a model that ignores minority classes will be penalised even if it achieves high overall accuracy.
+
+\subsection{Training Objective and Procedure}
+\label{sec:training}
+
+All neural network models (MLP, GRU, LSTM, ResNet, and all hybrid architectures) share a common training objective and optimisation procedure, described here once to avoid repetition.
+
+\subsubsection{Loss Function}
+The training objective is the \textbf{weighted cross-entropy loss}, which adjusts the contribution of each class to account for the imbalanced label distribution:
+\begin{equation}
+\mathcal{L} = -\frac{1}{N}\sum_{n=1}^{N} \sum_{c=1}^{C} w_c \; y_{n,c} \; \log\bigl(\hat{p}_{n,c}\bigr)
+\label{eq:wce}
+\end{equation}
+where:
+\begin{itemize}
+    \item $N$ is the number of training samples in the current fold,
+    \item $C$ is the number of classes (2 for binary, 3 for the three-class task),
+    \item $y_{n,c} \in \{0, 1\}$ is the one-hot ground-truth label for sample $n$ and class $c$,
+    \item $\hat{p}_{n,c} = \text{softmax}(\mathbf{z}_n)_c$ is the predicted probability for class $c$, where $\mathbf{z}_n \in \mathbb{R}^C$ is the model's logit output,
+    \item $w_c$ is the class weight for class $c$.
+\end{itemize}
+
+\subsubsection{Class Weight Computation}
+Class weights are computed from the training-fold label distribution so that under-represented classes receive higher weight:
+\begin{equation}
+w_c = \frac{C}{N_c \;\cdot\; \sum_{j=1}^{C} \frac{1}{N_j}}
+\label{eq:classweights}
+\end{equation}
+where $N_c$ is the number of training samples with label $c$.
+In practice, this is implemented as $w_c \propto 1/N_c$, normalised so that $\sum_c w_c = C$.
+Weights are recomputed for every LOSO fold to reflect the training-set composition after one subject is held out.
+For scikit-learn models (Random Forest), the equivalent \texttt{class\_weight='balanced'} option applies the same inverse-frequency weighting internally.
+
+\subsubsection{Optimiser}
+All neural networks are trained with the \textbf{Adam} optimiser:
+\begin{equation}
+\theta_{t+1} = \theta_t - \alpha \;\frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+\label{eq:adam}
+\end{equation}
+where $\theta_t$ denotes the model parameters at step $t$, $\alpha = 10^{-3}$ is the learning rate, $\hat{m}_t$ and $\hat{v}_t$ are bias-corrected estimates of the first and second moments of the gradient, and $\epsilon = 10^{-8}$ is a numerical stability constant.
+Adam is chosen for its adaptive per-parameter learning rates, which suit the heterogeneous gradient scales across convolutional, recurrent, and dense layers.
+
+\subsubsection{Training Loop}
+Each LOSO fold proceeds as follows:
+\begin{enumerate}
+    \item \textbf{Fold split.} Subject $k$ is held out as the test set; the remaining 14 subjects form the training set.
+    \item \textbf{Feature standardisation.} For tabular models, all features are z-standardised (zero mean, unit variance) using statistics computed on the training fold only, then applied to the test fold. For raw time-series models in the improved pipeline (Part~C), per-subject z-normalisation is applied per channel before windowing.
+    \item \textbf{Class weight computation.} Weights $w_c$ are derived from the training-fold label counts (Eq.~\ref{eq:classweights}).
+    \item \textbf{Mini-batch gradient descent.} Training data are shuffled and divided into mini-batches. The model processes each batch, computes the weighted cross-entropy loss (Eq.~\ref{eq:wce}), and updates parameters via Adam (Eq.~\ref{eq:adam}).
+    \item \textbf{Epoch budget.} Training runs for a fixed number of epochs without early stopping:
+    \begin{itemize}
+        \item Tabular MLP (Part~A): \textbf{80 epochs}, batch size 32.
+        \item Baseline RNN and ResNet (Part~B): \textbf{60 epochs}, batch size 16.
+        \item Improved hybrids (Part~C): \textbf{80 epochs}, batch size 16.
+    \end{itemize}
+    \item \textbf{Evaluation.} After training, the held-out subject's data is passed through the model to compute predictions. Per-fold accuracy and Macro-F1 are recorded.
+\end{enumerate}
+
+This procedure is repeated for all 15 subjects, and the final reported metrics are the mean $\pm$ standard deviation across all 15 folds.
+Scikit-learn models (Logistic Regression, Random Forest, XGBoost) follow the same fold-split and standardisation protocol but use their own internal fitting procedures rather than the gradient-descent loop above.
+
 \subsection{Part A: Tabular Classification on Engineered Features}
 
 \subsubsection{Logistic Regression}
@@ -804,6 +938,7 @@ The model uses L2 regularisation ($C = 1.0$) with the L-BFGS solver:
 \begin{equation}
 \hat{y} = \arg\max_{c} \left( \mathbf{w}_c^\top \mathbf{x} + b_c \right), \quad \text{with } \ell_2 \text{ penalty } \lambda \|\mathbf{w}\|_2^2
 \end{equation}
+where $\hat{y}$ is the predicted class label, $\mathbf{x} \in \mathbb{R}^d$ is the input feature vector ($d = 26$ or $29$), $\mathbf{w}_c \in \mathbb{R}^d$ is the weight vector for class $c$, $b_c$ is the bias term for class $c$, and $\lambda = 1/C = 1.0$ controls the strength of the $\ell_2$ regularisation penalty on the weight magnitudes.
 If Logistic Regression performs well, it suggests that the engineered features already provide good linear separability; a large gap versus nonlinear models indicates that complex feature interactions are important.
 
 \subsubsection{Random Forest}
@@ -812,7 +947,8 @@ Each tree is trained on a bootstrap sample and a random feature subset, and pred
 \begin{equation}
 \hat{y} = \text{mode}\left\{ h_t(\mathbf{x}) \right\}_{t=1}^{200}
 \end{equation}
-We use \texttt{class\_weight='balanced'} to up-weight minority classes.
+where $\hat{y}$ is the predicted class, $h_t(\mathbf{x})$ is the prediction of the $t$-th decision tree for input feature vector $\mathbf{x}$, and $\text{mode}\{\cdot\}$ selects the class predicted by the majority of the 200 trees.
+We use \texttt{class\_weight='balanced'} to up-weight minority classes (equivalent to the inverse-frequency weighting described in Eq.~\ref{eq:classweights}).
 Random Forest naturally handles nonlinear relationships and provides feature importance estimates, testing whether axis-aligned splits suffice.
 
 \subsubsection{XGBoost}
@@ -821,6 +957,8 @@ Unlike Random Forest, XGBoost fits each successive tree $f_t$ to the negative gr
 \begin{equation}
 \hat{y}^{(t)} = \hat{y}^{(t-1)} + \eta \cdot f_t(\mathbf{x})
 \end{equation}
+where $\hat{y}^{(t)}$ is the model's cumulative prediction after boosting round $t$, $\hat{y}^{(t-1)}$ is the prediction from the previous round, $\eta = 0.1$ is the learning rate (shrinkage factor) that scales each tree's contribution to prevent overfitting, $f_t(\mathbf{x})$ is the $t$-th regression tree fitted to the negative gradient residuals, and $\mathbf{x}$ is the input feature vector.
+The loss function used is multi-class log-loss (\texttt{mlogloss}).
 Comparing XGBoost against Random Forest reveals whether the boosting strategy yields meaningful gains on 1{,}178 windows.
 
 \subsubsection{Feed-Forward MLP (StressNet)}
@@ -875,11 +1013,12 @@ The MLP tests whether a parametric deep model outperforms non-parametric ensembl
 
 \subsubsection{Standalone GRU and LSTM}
 Raw wrist signals (6 channels resampled to 4\,Hz) are segmented into 30-second non-overlapping windows ($120 \times 6$).
-A GRU or LSTM processes the sequence and the final hidden state is passed to a linear classifier:
+A GRU or LSTM (2 layers, hidden dimension 64, dropout 0.3) processes the sequence and the final hidden state is passed to a linear classifier:
 \begin{align}
 \mathbf{h}_t &= \text{GRU/LSTM}(\mathbf{x}_t, \mathbf{h}_{t-1}) \\
 \hat{y} &= \text{softmax}(\mathbf{W} \mathbf{h}_T + \mathbf{b})
 \end{align}
+where $\mathbf{x}_t \in \mathbb{R}^6$ is the 6-channel input at time step $t$, $\mathbf{h}_t \in \mathbb{R}^{64}$ is the hidden state at time step $t$ encoding temporal context up to that point, $\mathbf{h}_{t-1}$ is the hidden state from the previous time step, $T = 120$ is the final time step of the window, $\mathbf{W} \in \mathbb{R}^{C \times 64}$ is the classification weight matrix, $\mathbf{b} \in \mathbb{R}^C$ is the bias vector, and $\hat{y} \in \mathbb{R}^C$ is the vector of predicted class probabilities.
 These serve as baselines for end-to-end learning from raw signals.
 
 \subsubsection{Standalone 1D-ResNet}
@@ -888,6 +1027,8 @@ The skip connections address vanishing gradients and enable deeper networks:
 \begin{equation}
 \mathbf{y} = \text{ReLU}(\mathbf{x} + \mathcal{F}(\mathbf{x}))
 \end{equation}
+where $\mathbf{x}$ is the input activation to a residual block, $\mathcal{F}(\mathbf{x})$ is the residual mapping learned by the two Conv1d layers within the block (each followed by batch normalisation), and $\mathbf{y}$ is the block's output.
+The addition $\mathbf{x} + \mathcal{F}(\mathbf{x})$ is the skip (identity) connection: if $\mathcal{F}$ learns to output zeros, the block reduces to an identity mapping, ensuring that adding depth cannot degrade performance.
 
 \subsection{Part C: Improved Hybrid Architectures on Raw Time-Series}
 
@@ -897,13 +1038,14 @@ Based on EDA insights (inter-subject variability, multi-scale temporal patterns)
 \end{itemize}
 
 \subsubsection{CNN-LSTM}
-A two-layer 1D-CNN front-end (kernels of size 7 and 5, BatchNorm, ReLU, MaxPool) extracts local temporal features, then an LSTM processes the resulting compressed sequence.
+A two-layer 1D-CNN front-end (kernels of size 7 and 5, 64 and 128 filters respectively, each followed by BatchNorm, ReLU, and MaxPool) extracts local temporal features, then an LSTM (hidden dimension 64, 1 layer) processes the resulting compressed sequence.
 The CNN captures short-range patterns (heartbeat morphology in BVP, phasic bursts in EDA) while the LSTM models longer-range temporal dependencies:
 \begin{align}
 \mathbf{z}_t &= \text{CNN}(\mathbf{x})_t \\
 \mathbf{h}_t &= \text{LSTM}(\mathbf{z}_t, \mathbf{h}_{t-1}) \\
 \hat{y} &= \text{softmax}(\mathbf{W} \mathbf{h}_T + \mathbf{b})
 \end{align}
+where $\mathbf{x} \in \mathbb{R}^{240 \times 6}$ is the raw input window (240 time steps, 6 channels), $\mathbf{z}_t \in \mathbb{R}^{128}$ is the CNN feature vector at compressed time step $t$ (after two rounds of convolution and pooling reduce the temporal dimension), $\mathbf{h}_t \in \mathbb{R}^{64}$ is the LSTM hidden state at step $t$, $T$ is the final compressed time step, $\mathbf{W} \in \mathbb{R}^{C \times 64}$ and $\mathbf{b} \in \mathbb{R}^C$ are the classification head parameters, and $\hat{y}$ is the predicted class probability vector.
 
 \subsubsection{CNN-GRU}
 Identical architecture but replaces the LSTM with a GRU, which has fewer parameters and often achieves comparable performance.
@@ -912,9 +1054,10 @@ Identical architecture but replaces the LSTM with a GRU, which has fewer paramet
 Adds a learned self-attention layer after the LSTM.
 Instead of relying solely on the last hidden state, attention computes a weighted average over all LSTM outputs:
 \begin{align}
-\alpha_t &= \frac{\exp(\mathbf{v}^\top \mathbf{h}_t)}{\sum_{j} \exp(\mathbf{v}^\top \mathbf{h}_j)} \\
-\mathbf{c} &= \sum_t \alpha_t \mathbf{h}_t
+\alpha_t &= \frac{\exp(\mathbf{v}^\top \mathbf{h}_t)}{\sum_{j=1}^{T} \exp(\mathbf{v}^\top \mathbf{h}_j)} \\
+\mathbf{c} &= \sum_{t=1}^{T} \alpha_t \mathbf{h}_t
 \end{align}
+where $\mathbf{h}_t \in \mathbb{R}^{64}$ is the LSTM hidden state at compressed time step $t$ (as defined in the CNN-LSTM equations above), $\mathbf{v} \in \mathbb{R}^{64}$ is a learned attention query vector, $\alpha_t \in [0, 1]$ is the attention weight for step $t$ (normalised via softmax so that $\sum_t \alpha_t = 1$), and $\mathbf{c} \in \mathbb{R}^{64}$ is the context vector, a weighted summary of all time steps that is passed to the classification head in place of $\mathbf{h}_T$.
 This allows the model to focus on the most informative time steps rather than compressing all information into the final state.
 
 % --- CNN-LSTM-ATTENTION ARCHITECTURE FIGURE ---
@@ -972,7 +1115,7 @@ This allows the model to focus on the most informative time steps rather than co
 \end{figure}
 
 \subsubsection{Multi-Scale CNN-LSTM}
-Parallel 1D convolutions with kernel sizes 3, 7, and 15 capture patterns at different temporal scales simultaneously---fast BVP oscillations (kernel~3), moderate EDA dynamics (kernel~7), and slow temperature drift (kernel~15).
+Parallel 1D convolutions with kernel sizes 3, 7, and 15 capture patterns at different temporal scales simultaneously: fast BVP oscillations (kernel~3), moderate EDA dynamics (kernel~7), and slow temperature drift (kernel~15).
 Outputs are concatenated, pooled, then fed to an LSTM with self-attention.
 
 \subsubsection{ResNet-LSTM}
@@ -1224,14 +1367,14 @@ All models gain 12--19 percentage points in Macro-F1 moving from 3-class to bina
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.85\linewidth]{tabular_confusion_matrices.pdf}
-\caption{Aggregate LOSO confusion matrices for the best tabular models. \textbf{Left}: MLP on the 3-class task (sensor features)---Stress recall is high (94.6\%) but Amusement is frequently confused with Baseline. \textbf{Right}: MLP on the binary task (sensor+demographics)---92.6\% of Not-Stress and 93.2\% of Stress windows are correctly classified.}
+\caption{Aggregate LOSO confusion matrices for the best tabular models. \textbf{Left}: MLP on the 3-class task (sensor features), where Stress recall is high (94.6\%) but Amusement is frequently confused with Baseline. \textbf{Right}: MLP on the binary task (sensor+demographics), where 92.6\% of Not-Stress and 93.2\% of Stress windows are correctly classified.}
 \label{fig:tabular-cm}
 \end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.85\linewidth]{mlp_per_subject_loso.pdf}
-\caption{MLP per-subject LOSO performance. \textbf{Top}: 3-class (sensor features)---S9 and S11 achieve $>$0.92 accuracy while S14 and S17 fall below 0.51. \textbf{Bottom}: binary (sensor+demographics)---most subjects reach near-perfect accuracy, but S3, S14, and S17 remain harder. Dashed lines show cross-subject means.}
+\caption{MLP per-subject LOSO performance. \textbf{Top}: 3-class (sensor features), where S9 and S11 achieve $>$0.92 accuracy while S14 and S17 fall below 0.51. \textbf{Bottom}: binary (sensor+demographics), where most subjects reach near-perfect accuracy, but S3, S14, and S17 remain harder. Dashed lines show cross-subject means.}
 \label{fig:mlp-persub}
 \end{figure}
 
@@ -1294,7 +1437,7 @@ F1  & .53 & .30 & .72 & .35 & .68 & .42 & .20 & .45 & .82 & .55 & .58 & .42 & .7
 \end{tabular}
 \end{table}
 
-Standalone RNNs and ResNets on raw 30-second, non-overlapping windows achieve 0.50--0.79 accuracy---substantially below the tabular models.
+Standalone RNNs and ResNets on raw 30-second, non-overlapping windows achieve 0.50--0.79 accuracy, substantially below the tabular models.
 The GRU is the best-performing RNN (3-class Macro-F1 = 0.519), but even it falls far short of the tabular XGBoost (0.677).
 Per-subject results (Table~\ref{tab:gru-persub}) show extreme variance: S10 achieves 0.84 while S8 drops to 0.24.
 This under-performance is attributable to (a)~the very low wrist sampling rate (4\,Hz effective); (b)~large inter-subject variability without per-subject normalisation; and (c)~insufficient training data from non-overlapping segmentation.
@@ -1432,14 +1575,14 @@ The MultiScale-LSTM under-performs, suggesting that the additional capacity from
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.85\linewidth]{hybrid_confusion_matrices.pdf}
-\caption{Aggregate LOSO confusion matrices for the best hybrid models. \textbf{Left}: ResNet-LSTM on the 3-class task---Amusement confusion with Baseline is reduced relative to tabular models. \textbf{Right}: CNN-LSTM-Attention on the binary task---91.0\% Stress recall with only 9.3\% false-alarm rate on Not-Stress windows.}
+\caption{Aggregate LOSO confusion matrices for the best hybrid models. \textbf{Left}: ResNet-LSTM on the 3-class task, where Amusement confusion with Baseline is reduced relative to tabular models. \textbf{Right}: CNN-LSTM-Attention on the binary task, achieving 91.0\% Stress recall with only 9.3\% false-alarm rate on Not-Stress windows.}
 \label{fig:hybrid-cm}
 \end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.85\linewidth]{hybrid_per_subject_loso.pdf}
-\caption{Per-subject LOSO performance for the best hybrid models. \textbf{Top}: ResNet-LSTM (3-class)---S9 achieves perfect accuracy while S14 remains the hardest subject (F1 = 0.38). \textbf{Bottom}: CNN-LSTM-Attention (binary)---most subjects exceed 0.90 F1, but S3 (0.56) and S17 (0.72) remain outliers, mirroring the tabular results.}
+\caption{Per-subject LOSO performance for the best hybrid models. \textbf{Top}: ResNet-LSTM (3-class), where S9 achieves perfect accuracy while S14 remains the hardest subject (F1 = 0.38). \textbf{Bottom}: CNN-LSTM-Attention (binary), where most subjects exceed 0.90 F1, but S3 (0.56) and S17 (0.72) remain outliers, mirroring the tabular results.}
 \label{fig:hybrid-persub}
 \end{figure}
 
@@ -1471,7 +1614,7 @@ The MultiScale-LSTM under-performs, suggesting that the additional capacity from
     The low wrist sampling rate (4\,Hz for EDA/TEMP, 64\,Hz for BVP downsampled to 4\,Hz) limits the information density available to sequence models compared to hand-crafted features that compress domain knowledge.
 
     \item \textbf{Hybrid architectures and improved preprocessing close the gap.}
-    The CNN-LSTM-Attention model achieves binary Macro-F1 of 0.897 on raw signals---within 3\% of the tabular MLP (0.921)---while the ResNet-LSTM achieves 3-class Macro-F1 of 0.667, nearly matching XGBoost (0.677).
+    The CNN-LSTM-Attention model achieves binary Macro-F1 of 0.897 on raw signals (within 3\% of the tabular MLP at 0.921), while the ResNet-LSTM achieves 3-class Macro-F1 of 0.667, nearly matching XGBoost (0.677).
     Per-subject normalisation, overlapping windows, and the combination of convolutional feature extraction with recurrent temporal modelling are the key enablers.
 
     \item \textbf{Amusement remains the hardest class.}
@@ -1498,6 +1641,20 @@ The MultiScale-LSTM under-performs, suggesting that the additional capacity from
     \item \textbf{Domain adaptation}: Transfer learning from a pre-trained model on a larger physiological dataset (e.g., MIMIC or PhysioNet) could improve generalisation with limited WESAD subjects.
     \item \textbf{Free-living evaluation}: Validating models on uncontrolled, in-the-wild stress datasets would test real-world applicability.
     \item \textbf{Interpretability}: Attention weight visualisation and SHAP-based feature attribution could provide clinical insight into which temporal patterns drive predictions.
+\end{itemize}
+
+
+% ======================================================================
+\appendix
+\section{Appendix}
+\label{sec:appendix}
+
+\subsection{Code Repository}
+
+The full codebase for data preparation, exploratory data analysis, tabular modelling, raw time-series modelling, and report generation is available in the GitHub repository below:
+
+\begin{itemize}
+    \item \textbf{GitHub Repository}: \url{https://github.com/anishwac0311/StressDetectionfromWearablePhysiologicalSignals.git}
 \end{itemize}
 
 
